@@ -1,0 +1,30 @@
+# STM32CubeIDE / Eclipse project files to ignore
+
+# Build directories
+Debug/
+Release/
+
+# Eclipse / STM32CubeIDE configuration
+.settings/
+.project
+.cproject
+.loadpath
+.launch
+
+# Temporary files
+*.bak
+*.tmp
+*.swp
+*.log
+*.d
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup and autosave
+*~
+*.autosave
+
+# Miscellaneous
+.metadata/
