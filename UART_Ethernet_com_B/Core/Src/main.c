@@ -102,10 +102,12 @@ static void udp_bridge_init(void)
 
   udp_recv(g_upcb, udp_rx_cb, NULL);
 
-  // Для платы A: peer = 192.168.10.11
-  IP4_ADDR(&g_peer_ip, 192, 168, 10, 10);   // плата B -> плата A
-  //IP4_ADDR(&g_peer_ip, 192, 168, 10, 11);   // плата A -> плата B
-  //IP4_ADDR(&g_peer_ip, 192, 168, 10, 1);   // плата A -> ноут
+  // Board A = 192.168.10.10
+  // Board B = 192.168.10.11
+  //IP4_ADDR(&g_peer_ip, 192, 168, 10, 11);   // board A -> board B
+  IP4_ADDR(&g_peer_ip, 192, 168, 10, 10);   // board B -> board A
+
+
   const char *msg = "UDP bridge ready\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
 }
