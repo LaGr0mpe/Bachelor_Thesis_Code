@@ -32,7 +32,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PTP_SYNC        0
+#define PTP_DELAY_REQ   1
+#define PTP_FOLLOW_UP   8
+#define PTP_DELAY_RESP  9
+#define PTP_ANNOUNCE    11
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -84,6 +88,24 @@ volatile uint32_t ptp_rx_count;
 
 volatile uint32_t rx_hw_sec;
 volatile uint32_t rx_hw_nsec;
+
+volatile uint16_t ptp_seq_id;
+
+volatile uint32_t follow_sec;
+volatile uint32_t follow_nsec;
+
+volatile uint32_t sync_rx_sec;
+volatile uint32_t sync_rx_nsec;
+
+volatile uint16_t sync_seq_id;
+
+volatile int64_t ptp_offset;
+volatile int32_t ptp_offset_ns;
+volatile int32_t test_offset;
+
+volatile uint8_t ptp_synced = 0;
+
+volatile uint8_t sync_received = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -146,7 +168,7 @@ int main(void)
   HAL_ETH_Start_IT(&heth);
 
   /* Configure PTP clock increment */
-  ETH->MACFFR |= ETH_MACFFR_RA;
+  ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
 
   ETH->PTPSSIR = 43;
 
@@ -279,6 +301,8 @@ static void MX_ETH_Init(void)
   {
     Error_Handler();
   }
+
+  ETH->DMABMR |= ETH_DMABMR_AAB;
 
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
@@ -486,15 +510,106 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
         if (eth_type == 0x88F7)
         {
             ptp_message = buf[14] & 0x0F;
+            ptp_seq_id = ((uint16_t)buf[44] << 8) | buf[45];
             ptp_rx_count++;
 
+            uint32_t idx = heth->RxDescList.RxDescIdx;
+
+            if (idx == 0)
+                idx = ETH_RX_DESC_CNT - 1;
+            else
+                idx--;
+
             ETH_DMADescTypeDef *desc =
-                heth->RxDescList.RxDesc[heth->RxDescList.RxDescIdx];
+                (ETH_DMADescTypeDef *)heth->RxDescList.RxDesc[idx];
 
             uint32_t *d = (uint32_t*)desc;
 
-            rx_hw_sec  = d[7];
-            rx_hw_nsec = d[6];
+            if (d[0] & (1 << 17))   // timestamp valid
+            {
+                rx_hw_nsec = d[6];
+                rx_hw_sec  = d[7];
+            }
+
+            if (ptp_message == PTP_SYNC)
+            {
+                sync_seq_id = ptp_seq_id;
+
+                sync_rx_sec  = rx_hw_sec;
+                sync_rx_nsec = rx_hw_nsec;
+
+                sync_received = 1;
+            }
+
+            if (ptp_message == PTP_FOLLOW_UP)
+            {
+                follow_sec =
+                    ((uint32_t)buf[48] << 24) |
+                    ((uint32_t)buf[49] << 16) |
+                    ((uint32_t)buf[50] << 8) |
+                    buf[51];
+
+                uint32_t frac =
+                    ((uint32_t)buf[52] << 24) |
+                    ((uint32_t)buf[53] << 16) |
+                    ((uint32_t)buf[54] << 8) |
+                    buf[55];
+
+                follow_nsec = frac >> 16;
+
+                if (ptp_seq_id == sync_seq_id && sync_received)
+                {
+                    int64_t t1 =
+                        ((int64_t)follow_sec * 1000000000LL) + follow_nsec;
+
+                    int64_t t2 =
+                        ((int64_t)sync_rx_sec * 1000000000LL) + sync_rx_nsec;
+
+                    ptp_offset = t2 - t1;
+                    ptp_offset_ns = (int32_t)(ptp_offset % 1000000000LL);
+                    test_offset = (int32_t)sync_rx_nsec - (int32_t)follow_nsec;
+
+                    if (ptp_synced)
+                    {
+//                        if (ptp_offset_ns > 50000 || ptp_offset_ns < -50000)
+//                        {
+//                            int32_t corr = -ptp_offset_ns;
+//                            uint32_t update;
+//
+//                            if (corr < 0)
+//                            {
+//                                update = ((uint32_t)(-corr) & 0x7FFFFFFF) | (1UL << 31);
+//                            }
+//                            else
+//                            {
+//                                update = (uint32_t)corr & 0x7FFFFFFF;
+//                            }
+//
+//                            if (!(ETH->PTPTSCR & ETH_PTPTSCR_TSSTU))
+//                            {
+//                                ETH->PTPTSHUR = 0;       // обязательно
+//                                ETH->PTPTSLUR = update;
+//                                ETH->PTPTSCR |= ETH_PTPTSCR_TSSTU;
+//                            }
+//                        }
+                    }
+
+                    /* ---------- INITIAL SYNC ---------- */
+
+                    if (!ptp_synced)
+                    {
+                        if (!(ETH->PTPTSCR & ETH_PTPTSCR_TSSTI))
+                        {
+                            ETH->PTPTSHUR = follow_sec;
+                            ETH->PTPTSLUR = follow_nsec;
+
+                            ETH->PTPTSCR |= ETH_PTPTSCR_TSSTI;
+
+                            ptp_synced = 1;
+                        }
+                    }
+                }
+            }
 
             HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
         }
