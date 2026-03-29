@@ -74,6 +74,9 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
 uint8_t Rx_Buff[ETH_RX_DESC_CNT][1524];
+uint8_t delay_req_frame[58]; //14 b Ethernet header + 44 b PTPv2 Delay_Req by L2
+
+
 volatile uint32_t sec;
 volatile uint32_t nsec;
 
@@ -106,6 +109,39 @@ volatile int32_t test_offset;
 volatile uint8_t ptp_synced = 0;
 
 volatile uint8_t sync_received = 0;
+
+
+volatile uint16_t delayreq_seq_id = 0;
+volatile uint8_t  delayreq_pending = 0;
+
+volatile uint32_t tx_t3_sec;
+volatile uint32_t tx_t3_nsec;
+
+volatile uint32_t resp_t4_sec;
+volatile uint32_t resp_t4_nsec;
+
+volatile int64_t  mean_path_delay;
+volatile int64_t  ptp_offset_e2e;
+
+int64_t t1 = 0;
+int64_t t2 = 0;
+int64_t t3 = 0;
+int64_t t4 = 0;
+
+volatile uint32_t delayreq_tx_desc_idx = 0;
+volatile uint8_t  delayreq_tx_ts_waiting = 0;
+
+volatile int64_t offset_avg = 0;
+
+
+volatile uint32_t delayresp_count = 0;
+volatile uint32_t tx_ts_seen = 0;
+volatile uint32_t check_1 = 0;
+volatile uint32_t check_2 = 0;
+
+volatile int64_t  delta_sync = 0;
+volatile int64_t  delta_delay = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,6 +151,7 @@ static void MX_DMA_Init(void);
 static void MX_ETH_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
+static uint8_t PTP_TryReadTxTimestamp(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -166,11 +203,12 @@ int main(void)
   HAL_NVIC_EnableIRQ(ETH_IRQn);
 
   HAL_ETH_Start_IT(&heth);
+  __HAL_ETH_DMA_ENABLE_IT(&heth, ETH_DMA_IT_T);
 
   /* Configure PTP clock increment */
   ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
 
-  ETH->PTPSSIR = 43;
+  ETH->PTPSSIR = 5;
 
   /* Configure timestamping */
 
@@ -196,11 +234,20 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
 	  sec = ETH->PTPTSHR;
 	  nsec = ETH->PTPTSLR;
+
+
+
+
+	  PTP_TryReadTxTimestamp();
+
+
+	  HAL_ETH_ReleaseTxPacket(&heth);
 
   }
   /* USER CODE END 3 */
@@ -303,6 +350,7 @@ static void MX_ETH_Init(void)
   }
 
   ETH->DMABMR |= ETH_DMABMR_AAB;
+  ETH->DMABMR |= ETH_DMABMR_EDE;
 
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
@@ -464,6 +512,149 @@ static void MX_GPIO_Init(void)
 
 #define ETH_RX_BUFFER_SIZE 1524
 
+static void PTP_BuildDelayReqFrame(uint8_t *frame, uint16_t seq_id)
+{
+    memset(frame, 0, 58);
+
+    /* Ethernet header */
+    frame[0]  = 0x01;
+    frame[1]  = 0x1B;
+    frame[2]  = 0x19;
+    frame[3]  = 0x00;
+    frame[4]  = 0x00;
+    frame[5]  = 0x00;
+
+    frame[6]  = 0x00;
+    frame[7]  = 0x80;
+    frame[8]  = 0xE1;
+    frame[9]  = 0x00;
+    frame[10] = 0x00;
+    frame[11] = 0x00;
+
+    frame[12] = 0x88;
+    frame[13] = 0xF7;
+
+    /* PTP header */
+    frame[14] = 0x01;      /* messageType = Delay_Req */
+    frame[15] = 0x02;      /* versionPTP = 2 */
+
+    frame[16] = 0x00;
+    frame[17] = 44;        /* messageLength */
+
+    frame[18] = 0x00;      /* domainNumber */
+    frame[19] = 0x00;
+
+    frame[20] = 0x00;      /* flags[15:8] */
+    frame[21] = 0x00;      /* flags[7:0] */
+
+    /* correctionField = 0 */
+    /* bytes 22..29 already zero */
+
+    /* sourcePortIdentity: пока достаточно clockIdentity + port 1 */
+    frame[34] = 0x00;
+    frame[35] = 0x80;
+    frame[36] = 0xE1;
+    frame[37] = 0xFF;
+    frame[38] = 0xFE;
+    frame[39] = 0x00;
+    frame[40] = 0x00;
+    frame[41] = 0x00;
+    frame[42] = 0x00;
+    frame[43] = 0x01;
+
+    frame[44] = (seq_id >> 8) & 0xFF;
+    frame[45] = seq_id & 0xFF;
+
+    frame[46] = 0x01;      /* controlField для Delay_Req */
+    frame[47] = 0x7F;      /* logMessageInterval */
+
+    /* bytes 48..57 originTimestamp = 0 */
+}
+
+static void PTP_SendDelayReq(void)
+{
+    TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM |
+                          ETH_TX_PACKETS_FEATURES_CRCPAD;
+
+    ETH_BufferTypeDef txBuffer;
+    uint32_t seq = ++delayreq_seq_id;
+
+    PTP_BuildDelayReqFrame(delay_req_frame, seq);
+
+    txBuffer.buffer = delay_req_frame;
+    txBuffer.len    = sizeof(delay_req_frame);
+    txBuffer.next   = NULL;
+
+    TxConfig.Length   = sizeof(delay_req_frame);
+    TxConfig.TxBuffer = &txBuffer;
+
+    /* Запоминаем индекс текущего TX descriptor ДО передачи */
+    delayreq_tx_desc_idx = heth.TxDescList.CurTxDesc;
+
+    ETH_DMADescTypeDef *txdesc =
+            (ETH_DMADescTypeDef *)heth.TxDescList.TxDesc[delayreq_tx_desc_idx];
+
+        uint32_t *td = (uint32_t *)txdesc;
+
+        td[0] |= (1UL << 25);   // TDES0.TTSE = request TX timestamp for this frame
+
+
+    if (HAL_ETH_Transmit_IT(&heth, &TxConfig) == HAL_OK)
+    {
+        delayreq_pending = 1;
+        delayreq_tx_ts_waiting = 1;
+    }
+}
+
+static uint8_t PTP_TryReadTxTimestamp(void)
+{
+    if (!delayreq_tx_ts_waiting)
+        return 0;
+
+    ETH_DMADescTypeDef *txdesc =
+        (ETH_DMADescTypeDef *)heth.TxDescList.TxDesc[delayreq_tx_desc_idx];
+
+    uint32_t *td = (uint32_t *)txdesc;
+
+    if ((td[0] & (1UL << 31)) == 0) // OWN = 0
+    {
+        if (td[0] & (1UL << 17))   // TTSS
+        {
+            tx_t3_nsec = td[6];
+            tx_t3_sec  = td[7];
+            tx_ts_seen++;
+
+            delayreq_tx_ts_waiting = 0;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+
+static uint32_t PTP_ParseSecondsLow32(const uint8_t *ts)
+{
+    return ((uint32_t)ts[2] << 24) |
+           ((uint32_t)ts[3] << 16) |
+           ((uint32_t)ts[4] << 8)  |
+           ((uint32_t)ts[5]);
+}
+
+static uint32_t PTP_ParseNanoseconds(const uint8_t *ts)
+{
+    return ((uint32_t)ts[6] << 24) |
+           ((uint32_t)ts[7] << 16) |
+           ((uint32_t)ts[8] << 8)  |
+           ((uint32_t)ts[9]);
+}
+
+static int64_t PTP_ToNs(uint32_t sec, uint32_t nsec)
+{
+    return ((int64_t)sec * 1000000000LL) + (int64_t)nsec;
+}
+
 
 
 void HAL_ETH_RxAllocateCallback(uint8_t **buff)
@@ -493,9 +684,29 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buff, uint16_t 
 
 void HAL_ETH_TxFreeCallback(uint32_t *buff)
 {
+//    ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef*)buff;
+//    uint32_t *d = (uint32_t*)desc;
+//
+//    tx_ts_seen++;
+//
+//    if (d[0] & (1 << 17))
+//    {
+//    	tx_t3_nsec = d[6];
+//    	tx_t3_sec  = d[7];
+//
+//    }
+//    else
+//    {
+//        return; // или игнор пакета
+//    }
+
+	(void)buff;
+
+
 }
 
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
+
 {
     uint8_t *buf = NULL;
 
@@ -543,31 +754,13 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
 
             if (ptp_message == PTP_FOLLOW_UP)
             {
-                follow_sec =
-                    ((uint32_t)buf[48] << 24) |
-                    ((uint32_t)buf[49] << 16) |
-                    ((uint32_t)buf[50] << 8) |
-                    buf[51];
+            	const uint8_t *ts = &buf[48];
 
-                uint32_t frac =
-                    ((uint32_t)buf[52] << 24) |
-                    ((uint32_t)buf[53] << 16) |
-                    ((uint32_t)buf[54] << 8) |
-                    buf[55];
-
-                follow_nsec = frac >> 16;
+            	follow_sec  = PTP_ParseSecondsLow32(ts);
+            	follow_nsec = PTP_ParseNanoseconds(ts);
 
                 if (ptp_seq_id == sync_seq_id && sync_received)
                 {
-                    int64_t t1 =
-                        ((int64_t)follow_sec * 1000000000LL) + follow_nsec;
-
-                    int64_t t2 =
-                        ((int64_t)sync_rx_sec * 1000000000LL) + sync_rx_nsec;
-
-                    ptp_offset = t2 - t1;
-                    ptp_offset_ns = (int32_t)(ptp_offset % 1000000000LL);
-                    test_offset = (int32_t)sync_rx_nsec - (int32_t)follow_nsec;
 
                     if (ptp_synced)
                     {
@@ -598,6 +791,7 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
 
                     if (!ptp_synced)
                     {
+                    	check_1++;
                         if (!(ETH->PTPTSCR & ETH_PTPTSCR_TSSTI))
                         {
                             ETH->PTPTSHUR = follow_sec;
@@ -608,13 +802,103 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
                             ptp_synced = 1;
                         }
                     }
+
+                    if (ptp_synced && !delayreq_pending)
+                    {
+                    	PTP_SendDelayReq();
+                    }
+
+
                 }
             }
+
+
+
+            /* ---------- PTP_DELAY_RESP ---------- */
+
+            if (ptp_message == PTP_DELAY_RESP)
+            {
+                const uint8_t *ts = &buf[48];
+
+                resp_t4_sec  = PTP_ParseSecondsLow32(ts);
+                resp_t4_nsec = PTP_ParseNanoseconds(ts);
+
+                if (ptp_seq_id == delayreq_seq_id)
+                {
+                    delayresp_count++;
+                    delayreq_pending = 0;
+
+                    if (tx_t3_sec == 0 && tx_t3_nsec == 0)
+                    	return;
+
+                    // calvulate timestaps
+                    t1 = PTP_ToNs(follow_sec, follow_nsec);
+                    t2 = PTP_ToNs(sync_rx_sec, sync_rx_nsec);
+
+                    if (delayreq_tx_ts_waiting)
+                        return;
+
+                    t3 = PTP_ToNs(tx_t3_sec, tx_t3_nsec);
+                    t4 = PTP_ToNs(resp_t4_sec, resp_t4_nsec);
+
+                    delta_sync = t2 - t1;
+                    delta_delay = t4 - t3;
+
+                    mean_path_delay = ((t2 - t1) + (t4 - t3)) / 2;
+                    ptp_offset_e2e  = ((t2 - t1) - (t4 - t3)) / 2;
+
+                    offset_avg = (offset_avg * 3 + ptp_offset_e2e) / 4;
+
+
+                    if (offset_avg > 100000LL || offset_avg < -100000LL)
+                    {
+                        int64_t corr = -(offset_avg / 8);
+                        if (corr > 1000000LL)  corr = 1000000LL;
+                        if (corr < -1000000LL) corr = -1000000LL;
+
+                        uint32_t sec_upd = 0;
+                        uint32_t nsec_upd = 0;
+
+                        if (corr < 0)
+                        {
+                            int64_t mag = -corr;
+
+                            sec_upd  = (uint32_t)(mag / 1000000000LL);
+                            nsec_upd = (uint32_t)(mag % 1000000000LL);
+                            nsec_upd |= (1UL << 31);   // negative update
+                        }
+                        else
+                        {
+                            sec_upd  = (uint32_t)(corr / 1000000000LL);
+                            nsec_upd = (uint32_t)(corr % 1000000000LL);
+                        }
+
+                        if (!(ETH->PTPTSCR & ETH_PTPTSCR_TSSTU))
+                        {
+                            ETH->PTPTSHUR = sec_upd;
+                            ETH->PTPTSLUR = nsec_upd;
+                            ETH->PTPTSCR |= ETH_PTPTSCR_TSSTU;
+                        }
+                    }
+
+
+                }
+            }
+
+
+
+
+
 
             HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
         }
     }
 }
+
+
+
+
+
 
 /* USER CODE END 4 */
 
