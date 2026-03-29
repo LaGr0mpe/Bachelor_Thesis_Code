@@ -68,8 +68,9 @@ typedef struct
 #define PTP_SUBSEC_INCREMENT_NS       5ULL
 #define PTP_ENABLE_FINE_MODE          1U
 
-/* Keep current project behavior for update writes while TSSSR=1. */
-#define PTP_WRITE_UPDATE_AS_NS        1U
+/* RM0410: PTPTSLUR/PTPTSHUR update path uses subsecond representation. */
+#define PTP_NS_PER_SEC                1000000000ULL
+#define PTP_SUBSEC_PER_SEC            0x80000000ULL
 
 #define PTP_OFFSET_DEADBAND_NS        50000LL
 #define PTP_CORR_DIV                  4LL
@@ -176,6 +177,10 @@ volatile uint32_t ptp_default_addend = 0U;
 volatile uint32_t ptp_current_addend = 0U;
 volatile uint32_t ptp_addend_update_count = 0U;
 
+volatile uint32_t ptp_last_update_hur = 0U;
+volatile uint32_t ptp_last_update_lur = 0U;
+volatile int64_t  ptp_last_update_ns  = 0;
+
 /* Freeze-baseline diagnostics */
 volatile uint32_t ptp_tx_req_fail_count = 0U;
 volatile uint32_t ptp_tx_ts_miss_count = 0U;
@@ -206,6 +211,7 @@ static void PTP_SendDelayReq(void);
 static void PTP_BuildDelayReqFrame(uint8_t *frame, uint16_t seq_id);
 static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t loops);
 static uint32_t PTP_NsToSubsec(uint32_t ns_val);
+static uint32_t PTP_SubsecToNs(uint32_t subsec_val);
 static uint32_t PTP_UpdateLowFromNs(uint32_t ns_val, uint8_t negative);
 static uint32_t PTP_CalcDefaultAddend(void);
 static uint8_t PTP_ApplyAddend(uint32_t addend);
@@ -579,6 +585,7 @@ static void PTP_HW_Init(void)
     (void)PTP_ApplyTimeInitialize(0U, 0U);
 }
 
+
 static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t loops)
 {
     while (((*reg) & mask) != 0U)
@@ -594,18 +601,41 @@ static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32
 
 static uint32_t PTP_NsToSubsec(uint32_t ns_val)
 {
-    uint64_t tmp = ((uint64_t)ns_val << 31) + 500000000ULL;
-    return (uint32_t)(tmp / 1000000000ULL);
+    uint64_t tmp;
+
+    if (ns_val >= 1000000000UL)
+    {
+        ns_val = 999999999UL;
+    }
+
+    tmp = ((uint64_t)ns_val * PTP_SUBSEC_PER_SEC + (PTP_NS_PER_SEC / 2ULL)) / PTP_NS_PER_SEC;
+    if (tmp > 0x7FFFFFFFULL)
+    {
+        tmp = 0x7FFFFFFFULL;
+    }
+
+    return (uint32_t)tmp;
+}
+
+static uint32_t PTP_SubsecToNs(uint32_t subsec_val)
+{
+    uint64_t tmp;
+
+    subsec_val &= 0x7FFFFFFFUL;
+    tmp = ((uint64_t)subsec_val * PTP_NS_PER_SEC + (PTP_SUBSEC_PER_SEC / 2ULL)) / PTP_SUBSEC_PER_SEC;
+    if (tmp > 999999999ULL)
+    {
+        tmp = 999999999ULL;
+    }
+
+    return (uint32_t)tmp;
 }
 
 static uint32_t PTP_UpdateLowFromNs(uint32_t ns_val, uint8_t negative)
 {
     uint32_t low;
-#if PTP_WRITE_UPDATE_AS_NS
-    low = ns_val;
-#else
+
     low = PTP_NsToSubsec(ns_val) & 0x7FFFFFFFUL;
-#endif
     if (negative != 0U)
     {
         low |= 0x80000000UL;
@@ -642,13 +672,21 @@ static uint8_t PTP_ApplyAddend(uint32_t addend)
 
 static uint8_t PTP_ApplyTimeInitialize(uint32_t sec_val, uint32_t nsec_val)
 {
-    if (!PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTI, PTP_WAIT_LOOP))
+    uint32_t low;
+
+    if (!PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTI | ETH_PTPTSCR_TSSTU, PTP_WAIT_LOOP))
     {
         return 0U;
     }
 
+    low = PTP_UpdateLowFromNs(nsec_val, 0U);
+
     ETH->PTPTSHUR = sec_val;
-    ETH->PTPTSLUR = PTP_UpdateLowFromNs(nsec_val, 0U);
+    ETH->PTPTSLUR = low;
+    ptp_last_update_hur = sec_val;
+    ptp_last_update_lur = low;
+    ptp_last_update_ns  = PTP_ToNs(sec_val, nsec_val);
+
     ETH->PTPTSCR |= ETH_PTPTSCR_TSSTI;
 
     return PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTI, PTP_WAIT_LOOP);
@@ -659,8 +697,14 @@ static uint8_t PTP_ApplyTimeUpdateNs(int64_t corr_ns)
     uint32_t sec_upd;
     uint32_t nsec_mag;
     uint8_t negative;
+    uint32_t low;
 
-    if (!PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTU, PTP_WAIT_LOOP))
+    if (corr_ns == 0)
+    {
+        return 1U;
+    }
+
+    if (!PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTI | ETH_PTPTSCR_TSSTU, PTP_WAIT_LOOP))
     {
         return 0U;
     }
@@ -682,8 +726,14 @@ static uint8_t PTP_ApplyTimeUpdateNs(int64_t corr_ns)
         nsec_mag = (uint32_t)(corr_ns % 1000000000LL);
     }
 
+    low = PTP_UpdateLowFromNs(nsec_mag, negative);
+
     ETH->PTPTSHUR = sec_upd;
-    ETH->PTPTSLUR = PTP_UpdateLowFromNs(nsec_mag, negative);
+    ETH->PTPTSLUR = low;
+    ptp_last_update_hur = sec_upd;
+    ptp_last_update_lur = low;
+    ptp_last_update_ns  = corr_ns;
+
     ETH->PTPTSCR |= ETH_PTPTSCR_TSSTU;
 
     return PTP_WaitRegBitClear(&ETH->PTPTSCR, ETH_PTPTSCR_TSSTU, PTP_WAIT_LOOP);
