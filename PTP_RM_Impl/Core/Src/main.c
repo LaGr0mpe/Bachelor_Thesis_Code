@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.c
+  * @file           : main.c SLAVE
   * @brief          : Main program body
   ******************************************************************************
   * @attention
@@ -194,6 +194,11 @@ volatile uint8_t  ptp_request_delayreq = 0U;
 volatile PTP_RxTimestampEvent g_sync_evt = {0};
 volatile PTP_FollowUpEvent    g_follow_evt = {0};
 volatile PTP_DelayRespEvent   g_delayresp_evt = {0};
+
+volatile uint32_t sync_rx_ts_valid_count = 0U;
+volatile uint32_t sync_rx_ts_miss_count  = 0U;
+volatile uint32_t sync_rx_sw_fallback_count = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -395,9 +400,9 @@ static void MX_ETH_Init(void)
   ETH->DMABMR |= ETH_DMABMR_EDE;
 
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
-  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
-  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
+  TxConfig.Attributes   = ETH_TX_PACKETS_FEATURES_CRCPAD;
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
+  TxConfig.CRCPadCtrl   = ETH_CRC_PAD_INSERT;
   /* USER CODE BEGIN ETH_Init 2 */
 
   /* USER CODE END ETH_Init 2 */
@@ -568,7 +573,7 @@ static void PTP_HW_Init(void)
     ptptscr |= ETH_PTPTSCR_TSE;
     ptptscr |= ETH_PTPTSCR_TSPTPPSV2E;
     ptptscr |= ETH_PTPTSCR_TSSPTPOEFE;
-    ptptscr |= ETH_PTPTSCR_TSSEME;
+    //ptptscr |= ETH_PTPTSCR_TSSEME;
     ptptscr |= ETH_PTPTSCR_TSSSR;
     ptptscr |= ETH_PTPTSCR_TSSARFE;
 #if PTP_ENABLE_FINE_MODE
@@ -803,8 +808,9 @@ static void PTP_SendDelayReq(void)
     uint32_t *td;
     uint16_t seq;
 
-    TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM |
-                          ETH_TX_PACKETS_FEATURES_CRCPAD;
+    TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CRCPAD;
+    TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
+    TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
 
     seq = ++delayreq_seq_id;
     PTP_BuildDelayReqFrame(delay_req_frame, seq);
@@ -1053,10 +1059,16 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_local)
         desc = (ETH_DMADescTypeDef *)heth_local->RxDescList.RxDesc[idx];
         d = (uint32_t *)desc;
 
+        uint8_t rx_hw_valid = 0U;
+
+        rx_hw_sec  = 0U;
+        rx_hw_nsec = 0U;
+
         if ((d[0] & (1UL << 17)) != 0U)
         {
             rx_hw_nsec = d[6];
             rx_hw_sec  = d[7];
+            rx_hw_valid = 1U;
         }
 
         if (ptp_message == PTP_SYNC)
@@ -1065,10 +1077,24 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_local)
             {
                 ptp_rx_overwrite_count++;
             }
+
             g_sync_evt.pending = 1U;
             g_sync_evt.seq_id  = ptp_seq_id;
-            g_sync_evt.sec     = rx_hw_sec;
-            g_sync_evt.nsec    = rx_hw_nsec;
+
+            if (rx_hw_valid != 0U)
+            {
+                g_sync_evt.sec  = rx_hw_sec;
+                g_sync_evt.nsec = rx_hw_nsec;
+                sync_rx_ts_valid_count++;
+            }
+            else
+            {
+                /* Bring-up fallback: use software readout if hardware RX timestamp is absent */
+                g_sync_evt.sec  = rx_sec;
+                g_sync_evt.nsec = rx_nsec;
+                sync_rx_ts_miss_count++;
+                sync_rx_sw_fallback_count++;
+            }
         }
         else if (ptp_message == PTP_FOLLOW_UP)
         {
