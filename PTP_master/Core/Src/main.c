@@ -40,18 +40,24 @@ typedef struct
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define PTP_SYNC              0U
-#define PTP_DELAY_REQ         1U
-#define PTP_FOLLOW_UP         8U
-#define PTP_DELAY_RESP        9U
+#define PTP_SYNC                    0U
+#define PTP_DELAY_REQ               1U
+#define PTP_FOLLOW_UP               8U
+#define PTP_DELAY_RESP              9U
 
-#define ETH_RX_BUFFER_SIZE    1524U
-#define PTP_WAIT_LOOP         1000000U
-#define PTP_SYNC_PERIOD_MS    1000U
-#define PTP_NS_PER_SEC        1000000000ULL
-#define PTP_SUBSEC_PER_SEC    0x80000000ULL
+#define ETH_RX_BUFFER_SIZE          1524U
+#define PTP_WAIT_LOOP               1000000U
+#define PTP_SYNC_PERIOD_MS          1000U
 
-#define PTP_FOLLOWUP_DELAY_MS   20U
+#define PTP_HCLK_HZ                 216000000ULL
+#define PTP_SUBSEC_INCREMENT_NS     5ULL
+#define PTP_ENABLE_FINE_MODE        1U
+
+#define PTP_NS_PER_SEC              1000000000ULL
+#define PTP_SUBSEC_PER_SEC          0x80000000ULL
+
+#define PTP_MASTER_START_SEC        1774800000UL
+#define PTP_MASTER_START_NSEC       0UL
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -94,40 +100,29 @@ uint8_t sync_frame[58];
 uint8_t followup_frame[58];
 uint8_t delayresp_frame[68];
 
-volatile uint32_t sec;
-volatile uint32_t nsec;
+volatile uint16_t master_sync_seq_id = 0U;
+volatile uint32_t sync_t1_sec = 0U;
+volatile uint32_t sync_t1_nsec = 0U;
+volatile uint8_t  sync_tx_ts_waiting = 0U;
+volatile uint8_t  followup_pending = 0U;
+volatile uint32_t last_sync_sent_ms = 0U;
 
-volatile uint32_t rx_irq_count;
-volatile uint32_t ptp_rx_count;
-volatile uint32_t delayreq_rx_count;
-volatile uint32_t sync_tx_seen;
-volatile uint32_t followup_tx_count;
-volatile uint32_t delayresp_tx_count;
+volatile uint16_t followup_seq_id = 0U;
+volatile uint32_t followup_t1_sec = 0U;
+volatile uint32_t followup_t1_nsec = 0U;
 
-volatile uint16_t eth_type;
-volatile uint8_t  ptp_message;
-volatile uint16_t ptp_seq_id;
+volatile uint32_t delayreq_rx_count = 0U;
+volatile uint32_t sync_tx_seen = 0U;
+volatile uint32_t followup_tx_count = 0U;
+volatile uint32_t delayresp_tx_count = 0U;
+volatile uint32_t tx_ts_miss_count = 0U;
 
-volatile uint16_t master_sync_seq_id;
-volatile uint32_t sync_t1_sec;
-volatile uint32_t sync_t1_nsec;
-volatile uint8_t  sync_tx_ts_waiting;
-volatile uint8_t  followup_pending;
-volatile uint32_t sync_tx_desc_idx;
-volatile uint32_t sync_tx_start_count;
-volatile uint32_t sync_tx_fail_count;
-volatile uint32_t followup_tx_fail_count;
-volatile uint32_t delayresp_tx_fail_count;
-volatile uint32_t tx_ts_miss_count;
+volatile uint32_t ptp_default_addend = 0U;
+volatile uint32_t ptp_current_addend = 0U;
+volatile uint32_t ptp_addend_update_count = 0U;
+volatile uint32_t ptp_reg_timeout_count = 0U;
 
-volatile uint32_t ptp_default_addend = 3976821570UL;
-volatile uint32_t ptp_current_addend = 3976821570UL;
-volatile uint32_t ptp_addend_update_count;
-volatile uint32_t ptp_reg_timeout_count;
-
-volatile uint32_t last_sync_sent_ms;
-
-volatile PTP_DelayReqEvent g_delayreq_evt;
+volatile PTP_DelayReqEvent g_delayreq_evt = {0};
 
 static const uint8_t g_master_mac[6] = {0x00, 0x80, 0xE1, 0x00, 0x00, 0x01};
 static const uint8_t g_master_port_identity[10] =
@@ -135,12 +130,7 @@ static const uint8_t g_master_port_identity[10] =
   0x00, 0x80, 0xE1, 0xFF, 0xFE, 0x00, 0x00, 0x01, 0x00, 0x01
 };
 
-volatile uint32_t followup_ready_ms;
-volatile uint16_t followup_seq_id;
-volatile uint32_t followup_t1_sec;
-volatile uint32_t followup_t1_nsec;
-
-
+static uint32_t sync_tx_desc_idx = 0U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -151,6 +141,9 @@ static void MX_ETH_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
 /* USER CODE BEGIN PFP */
+static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout);
+static uint32_t PTP_NsToSubsecUpdate(uint32_t ns);
+static uint32_t PTP_CalcDefaultAddend(void);
 static uint8_t PTP_LoadAddend(uint32_t addend);
 static uint8_t PTP_MasterTimeInit(uint32_t sec_init, uint32_t nsec_init);
 static void PTP_MasterHwInit(void);
@@ -163,6 +156,7 @@ static uint8_t PTP_MasterSendDelayResp(const PTP_DelayReqEvent *evt);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout)
 {
   while (timeout--)
@@ -192,6 +186,13 @@ static uint32_t PTP_NsToSubsecUpdate(uint32_t ns)
   }
 
   return (uint32_t)v;
+}
+
+static uint32_t PTP_CalcDefaultAddend(void)
+{
+  const uint64_t num = (1ULL << 32) * 1000000000ULL;
+  const uint64_t den = PTP_HCLK_HZ * PTP_SUBSEC_INCREMENT_NS;
+  return (uint32_t)(num / den);
 }
 
 static uint8_t PTP_LoadAddend(uint32_t addend)
@@ -239,25 +240,31 @@ static uint8_t PTP_MasterTimeInit(uint32_t sec_init, uint32_t nsec_init)
 
 static void PTP_MasterHwInit(void)
 {
+  uint32_t ptptscr = 0U;
+
   ETH->DMABMR |= ETH_DMABMR_AAB;
   ETH->DMABMR |= ETH_DMABMR_EDE;
-
   ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
+  ETH->PTPSSIR = (uint32_t)PTP_SUBSEC_INCREMENT_NS;
 
-  ETH->PTPSSIR = 5U;
+  ptptscr |= ETH_PTPTSCR_TSE;
+  ptptscr |= ETH_PTPTSCR_TSPTPPSV2E;
+  ptptscr |= ETH_PTPTSCR_TSSPTPOEFE;
+  ptptscr |= ETH_PTPTSCR_TSSEME;
+  ptptscr |= ETH_PTPTSCR_TSSSR;
+  ptptscr |= ETH_PTPTSCR_TSSARFE;
+#if PTP_ENABLE_FINE_MODE
+  ptptscr |= ETH_PTPTSCR_TSFCU;
+#endif
+  ETH->PTPTSCR = ptptscr;
 
-  ETH->PTPTSCR =
-      ETH_PTPTSCR_TSE |
-      ETH_PTPTSCR_TSPTPPSV2E |
-      ETH_PTPTSCR_TSSPTPOEFE |
-      ETH_PTPTSCR_TSSEME |
-      ETH_PTPTSCR_TSSSR |
-      ETH_PTPTSCR_TSSARFE;
-
+  ptp_default_addend = PTP_CalcDefaultAddend();
+  ptp_current_addend = ptp_default_addend;
+#if PTP_ENABLE_FINE_MODE
   (void)PTP_LoadAddend(ptp_default_addend);
-  ETH->PTPTSCR |= ETH_PTPTSCR_TSFCU;
+#endif
 
-  (void)PTP_MasterTimeInit(1774800000UL, 0U);
+  (void)PTP_MasterTimeInit(PTP_MASTER_START_SEC, PTP_MASTER_START_NSEC);
 }
 
 static void PTP_StoreTimestampField(uint8_t *dst, uint32_t sec_v, uint32_t nsec_v)
@@ -283,23 +290,20 @@ static void PTP_FillL2Header(uint8_t *frame, const uint8_t *dst_mac, const uint8
 }
 
 static void PTP_BuildCommonHeader(uint8_t *frame, uint8_t msg_type, uint16_t message_length,
-                                   uint16_t seq_id, uint8_t control_field, uint8_t log_interval,
-                                   uint8_t two_step)
+                                  uint16_t seq_id, uint8_t control_field, uint8_t log_interval,
+                                  uint8_t two_step)
 {
   frame[14] = (uint8_t)(msg_type & 0x0FU);
-  frame[15] = 0x02; /* PTPv2 */
+  frame[15] = 0x02;
 
   frame[16] = (uint8_t)(message_length >> 8);
   frame[17] = (uint8_t)(message_length);
 
-  frame[18] = 0x00; /* domainNumber */
-  frame[19] = 0x00; /* reserved */
+  frame[18] = 0x00;
+  frame[19] = 0x00;
 
-  frame[20] = (two_step != 0U) ? 0x02U : 0x00U; /* flagField[15:8], twoStepFlag = 0x0200 */
-  frame[21] = 0x00U;                            /* flagField[7:0] */
-
-  /* correctionField [22..29] = 0 */
-  /* reserved [30..33] = 0 */
+  frame[20] = (two_step != 0U) ? 0x02U : 0x00U;
+  frame[21] = 0x00U;
 
   memcpy(&frame[34], g_master_port_identity, 10U);
 
@@ -316,8 +320,6 @@ static void PTP_BuildSyncFrame(uint8_t *frame, uint16_t seq_id)
   memset(frame, 0, 58U);
   PTP_FillL2Header(frame, ptp_multicast, g_master_mac);
   PTP_BuildCommonHeader(frame, PTP_SYNC, 44U, seq_id, 0x00U, 0x00U, 1U);
-
-  /* originTimestamp [48..57] kept zero for two-step Sync */
 }
 
 static void PTP_BuildFollowUpFrame(uint8_t *frame, uint16_t seq_id, uint32_t sec_t1, uint32_t nsec_t1)
@@ -368,18 +370,16 @@ static uint8_t PTP_MasterSendSync(void)
   sync_tx_desc_idx = heth.TxDescList.CurTxDesc;
   txdesc = (ETH_DMADescTypeDef *)heth.TxDescList.TxDesc[sync_tx_desc_idx];
   td = (uint32_t *)txdesc;
-  td[0] |= (1UL << 25); /* TDES0.TTSE */
+  td[0] |= (1UL << 25);
 
   if (PTP_MasterSendFrame(sync_frame, sizeof(sync_frame)) != 0U)
   {
     sync_tx_ts_waiting = 1U;
     followup_pending   = 0U;
-    sync_tx_start_count++;
-    last_sync_sent_ms = HAL_GetTick();
+    last_sync_sent_ms  = HAL_GetTick();
     return 1U;
   }
 
-  sync_tx_fail_count++;
   return 0U;
 }
 
@@ -396,23 +396,22 @@ static uint8_t PTP_MasterTryReadSyncTxTimestamp(void)
   txdesc = (ETH_DMADescTypeDef *)heth.TxDescList.TxDesc[sync_tx_desc_idx];
   td = (uint32_t *)txdesc;
 
-  if ((td[0] & (1UL << 31)) == 0U) /* OWN = 0 */
+  if ((td[0] & (1UL << 31)) == 0U)
   {
-	  if ((td[0] & (1UL << 17)) != 0U) /* TTSS */
-	  {
-	    sync_t1_nsec = td[6];
-	    sync_t1_sec  = td[7];
-	    sync_tx_seen++;
-	    sync_tx_ts_waiting = 0U;
+    if ((td[0] & (1UL << 17)) != 0U)
+    {
+      sync_t1_nsec = td[6];
+      sync_t1_sec  = td[7];
+      sync_tx_seen++;
+      sync_tx_ts_waiting = 0U;
 
-	    followup_seq_id    = master_sync_seq_id;
-	    followup_t1_sec    = sync_t1_sec;
-	    followup_t1_nsec   = sync_t1_nsec;
-	    followup_ready_ms  = HAL_GetTick() + PTP_FOLLOWUP_DELAY_MS;
-	    followup_pending   = 1U;
+      followup_seq_id  = master_sync_seq_id;
+      followup_t1_sec  = sync_t1_sec;
+      followup_t1_nsec = sync_t1_nsec;
+      followup_pending = 1U;
 
-	    return 1U;
-	  }
+      return 1U;
+    }
 
     tx_ts_miss_count++;
     sync_tx_ts_waiting = 0U;
@@ -432,7 +431,6 @@ static uint8_t PTP_MasterSendFollowUp(uint16_t seq_id, uint32_t sec_t1, uint32_t
     return 1U;
   }
 
-  followup_tx_fail_count++;
   return 0U;
 }
 
@@ -446,19 +444,19 @@ static uint8_t PTP_MasterSendDelayResp(const PTP_DelayReqEvent *evt)
     return 1U;
   }
 
-  delayresp_tx_fail_count++;
   return 0U;
 }
 
 static void PTP_MasterHandlePtpRx(ETH_HandleTypeDef *heth_ptr, uint8_t *buf)
 {
+  uint16_t ptp_message;
+  uint16_t ptp_seq_id;
   uint32_t idx;
   ETH_DMADescTypeDef *desc;
   uint32_t *d;
 
   ptp_message = (uint8_t)(buf[14] & 0x0FU);
   ptp_seq_id  = (uint16_t)(((uint16_t)buf[44] << 8) | buf[45]);
-  ptp_rx_count++;
 
   idx = heth_ptr->RxDescList.RxDescIdx;
   idx = (idx == 0U) ? (ETH_RX_DESC_CNT - 1U) : (idx - 1U);
@@ -474,7 +472,8 @@ static void PTP_MasterHandlePtpRx(ETH_HandleTypeDef *heth_ptr, uint8_t *buf)
     memcpy((void *)g_delayreq_evt.req_port_identity, &buf[34], 10U);
     memcpy((void *)g_delayreq_evt.dst_mac, &buf[6], 6U);
 
-    if ((d[0] & (1UL << 17)) != 0U)
+    /* On this setup, d[6]/d[7] carry the valid RX timestamp for Delay_Req. */
+    if ((d[6] != 0U) || (d[7] != 0U))
     {
       g_delayreq_evt.nsec = d[6];
       g_delayreq_evt.sec  = d[7];
@@ -492,17 +491,11 @@ static void PTP_MasterHandlePtpRx(ETH_HandleTypeDef *heth_ptr, uint8_t *buf)
 
 static void PTP_MasterProcess(void)
 {
-  sec = ETH->PTPTSHR;
-  nsec = ETH->PTPTSLR;
-
   (void)PTP_MasterTryReadSyncTxTimestamp();
 
   if (followup_pending != 0U)
   {
-	  if ((int32_t)(HAL_GetTick() - followup_ready_ms) >= 0)
-	  {
-	    (void)PTP_MasterSendFollowUp(followup_seq_id, followup_t1_sec, followup_t1_nsec);
-	  }
+    (void)PTP_MasterSendFollowUp(followup_seq_id, followup_t1_sec, followup_t1_nsec);
   }
 
   if (g_delayreq_evt.pending != 0U)
@@ -564,9 +557,7 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_ptr)
 
   if (HAL_ETH_ReadData(heth_ptr, (void **)&buf) == HAL_OK)
   {
-    rx_irq_count++;
-
-    eth_type = (uint16_t)(((uint16_t)buf[12] << 8) | buf[13]);
+    uint16_t eth_type = (uint16_t)(((uint16_t)buf[12] << 8) | buf[13]);
 
     if (eth_type == 0x88F7U)
     {
@@ -611,26 +602,21 @@ int main(void)
   MX_USB_OTG_FS_PCD_Init();
   /* USER CODE BEGIN 2 */
   HAL_ETH_RegisterRxAllocateCallback(&heth, HAL_ETH_RxAllocateCallback);
-  HAL_ETH_RegisterRxLinkCallback(&heth, HAL_ETH_RxLinkCallback);
-  HAL_ETH_RegisterTxFreeCallback(&heth, HAL_ETH_TxFreeCallback);
+    HAL_ETH_RegisterRxLinkCallback(&heth, HAL_ETH_RxLinkCallback);
+    HAL_ETH_RegisterTxFreeCallback(&heth, HAL_ETH_TxFreeCallback);
 
-  HAL_NVIC_EnableIRQ(ETH_IRQn);
+    HAL_NVIC_EnableIRQ(ETH_IRQn);
 
-  PTP_MasterHwInit();
+    PTP_MasterHwInit();
 
-  if (HAL_ETH_Start_IT(&heth) != HAL_OK)
-  {
-    Error_Handler();
-  }
+    if (HAL_ETH_Start_IT(&heth) != HAL_OK)
+    {
+      Error_Handler();
+    }
 
-  __HAL_ETH_DMA_ENABLE_IT(&heth, ETH_DMA_IT_T);
+    __HAL_ETH_DMA_ENABLE_IT(&heth, ETH_DMA_IT_T);
 
-  last_sync_sent_ms = HAL_GetTick() - PTP_SYNC_PERIOD_MS;
-
-  followup_ready_ms = 0U;
-  followup_seq_id   = 0U;
-  followup_t1_sec   = 0U;
-  followup_t1_nsec  = 0U;
+    last_sync_sent_ms = HAL_GetTick() - PTP_SYNC_PERIOD_MS;
 
   /* USER CODE END 2 */
 
