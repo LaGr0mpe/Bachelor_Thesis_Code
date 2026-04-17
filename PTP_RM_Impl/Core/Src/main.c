@@ -69,9 +69,29 @@ typedef struct
 #define PTP_NS_PER_SEC                1000000000ULL
 #define PTP_SUBSEC_PER_SEC            0x80000000ULL
 
-#define PTP_OFFSET_DEADBAND_NS        50000LL
-#define PTP_CORR_DIV                  4LL
-#define PTP_CORR_LIMIT_NS             200000LL
+#define PTP_PHASE_HARD_STEP_THRESHOLD_NS   5000000LL   /* 5 ms */
+#define PTP_PHASE_HARD_STEP_LIMIT_NS       1000000LL   /* 1 ms, только для редких крупных ошибок */
+
+#define PTP_FREQ_LOCK_PPB                   100LL
+#define PTP_FREQ_LOCK_MIN_CYCLES              8U
+#define PTP_PHASE_CAPTURE_THRESHOLD_NS    3000LL
+#define PTP_PHASE_CAPTURE_NUM                7LL
+#define PTP_PHASE_CAPTURE_DEN                8LL
+#define PTP_PHASE_CAPTURE_LIMIT_NS      100000LL
+#define PTP_PHASE_HOLDOFF_CYCLES            12U
+
+#define PTP_FREQ_MIN_CYCLE_NS            100000000LL  /* >=100 ms */
+#define PTP_FREQ_ADDEND_STEP_MAX             2000LL
+#define PTP_FREQ_ADDEND_OFFSET_MAX        1000000LL
+#define PTP_FREQ_DEADBAND_OFFSET_NS         1000LL
+#define PTP_FREQ_DEADBAND_PPB                 20LL
+
+#define PTP_FREQ_FAST_ZONE_NS              20000LL
+#define PTP_FREQ_MEDIUM_ZONE_NS             5000LL
+
+#define PTP_FREQ_SHIFT_FAST                    2U
+#define PTP_FREQ_SHIFT_MEDIUM                  3U
+#define PTP_FREQ_SHIFT_SLOW                    5U
 
 /* USER CODE END PD */
 
@@ -163,6 +183,22 @@ volatile PTP_DelayRespEvent   g_delayresp_evt = {0};
 
 static uint32_t delayreq_tx_desc_idx = 0U;
 
+volatile uint8_t  ptp_freq_servo_locked = 0U;
+
+volatile int64_t  ptp_master_time_prev = 0;
+volatile int64_t  ptp_slave_time_prev  = 0;
+volatile int64_t  ptp_master_count     = 0;
+volatile int64_t  ptp_slave_count      = 0;
+volatile int64_t  ptp_clock_diff       = 0;
+volatile int64_t  ptp_freq_err_ppb     = 0;
+volatile int64_t  ptp_last_addend_step = 0;
+
+volatile uint32_t ptp_freq_update_count = 0U;
+volatile uint32_t ptp_phase_step_count  = 0U;
+
+volatile uint32_t ptp_freq_lock_count = 0U;
+volatile uint8_t  ptp_phase_holdoff = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -188,6 +224,10 @@ static uint8_t PTP_ApplyTimeUpdateNs(int64_t corr_ns);
 static uint32_t PTP_ParseSecondsLow32(const uint8_t *ts);
 static uint32_t PTP_ParseNanoseconds(const uint8_t *ts);
 static int64_t  PTP_ToNs(uint32_t sec_val, uint32_t nsec_val);
+static void    PTP_ServoReset(void);
+static int64_t PTP_Abs64(int64_t v);
+static uint8_t PTP_ApplyAddendFiltered(int64_t delta_addend);
+static void    PTP_UpdateFrequencyServo(int64_t master_time_now, int64_t slave_time_now);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -276,7 +316,7 @@ static uint8_t PTP_ApplyTimeInitialize(uint32_t sec_val, uint32_t nsec_val)
 
     ETH->PTPTSHUR = sec_val;
     ETH->PTPTSLUR = low;
-    ptp_last_update_ns = PTP_ToNs(sec_val, nsec_val);
+    ptp_last_update_ns = 0;
 
     ETH->PTPTSCR |= ETH_PTPTSCR_TSSTI;
 
@@ -453,6 +493,9 @@ static void PTP_SendDelayReq(void)
     td = (uint32_t *)txdesc;
     td[0] |= (1UL << 25);
 
+    tx_t3_sec  = 0U;
+    tx_t3_nsec = 0U;
+
     if (HAL_ETH_Transmit_IT(&heth, &TxConfig) == HAL_OK)
     {
         delayreq_pending = 1U;
@@ -515,6 +558,8 @@ static void PTP_Process(void)
                 if (PTP_ApplyTimeInitialize(follow_sec, follow_nsec) != 0U)
                 {
                     ptp_synced = 1U;
+                    offset_avg = 0;
+                    PTP_ServoReset();
                 }
             }
 
@@ -545,7 +590,6 @@ static void PTP_Process(void)
 
             if (((tx_t3_sec != 0U) || (tx_t3_nsec != 0U)) && (delayreq_tx_ts_waiting == 0U))
             {
-                int64_t corr;
 
                 t1 = PTP_ToNs(follow_sec, follow_nsec);
                 t2 = PTP_ToNs(sync_rx_sec, sync_rx_nsec);
@@ -560,23 +604,88 @@ static void PTP_Process(void)
                 ptp_offset      = ptp_offset_e2e;
                 ptp_offset_ns   = (int32_t)ptp_offset_e2e;
 
-                offset_avg = (offset_avg * 3LL + ptp_offset_e2e) / 4LL;
-
-                if ((offset_avg > PTP_OFFSET_DEADBAND_NS) ||
-                    (offset_avg < -PTP_OFFSET_DEADBAND_NS))
                 {
-                    corr = -(offset_avg / PTP_CORR_DIV);
+                    int64_t master_time_now;
+                    int64_t slave_time_now;
+                    int64_t corr;
 
-                    if (corr > PTP_CORR_LIMIT_NS)
+                    offset_avg = (offset_avg * 7LL + ptp_offset_e2e) / 8LL;
+
+                    master_time_now = t1 + mean_path_delay;
+                    slave_time_now  = t2;
+
+                    /* 1) Частотная подстройка должна идти постоянно */
+                    PTP_UpdateFrequencyServo(master_time_now, slave_time_now);
+
+                    if (PTP_Abs64(ptp_freq_err_ppb) < PTP_FREQ_LOCK_PPB)
                     {
-                        corr = PTP_CORR_LIMIT_NS;
+                        if (ptp_freq_lock_count < 1000U)
+                        {
+                            ptp_freq_lock_count++;
+                        }
                     }
-                    if (corr < -PTP_CORR_LIMIT_NS)
+                    else
                     {
-                        corr = -PTP_CORR_LIMIT_NS;
+                        ptp_freq_lock_count = 0U;
                     }
 
-                    (void)PTP_ApplyTimeUpdateNs(corr);
+                    /* 2) Очень большая ошибка фазы -> редкий грубый шаг */
+                    if (PTP_Abs64(ptp_offset_e2e) > PTP_PHASE_HARD_STEP_THRESHOLD_NS)
+                    {
+                        corr = -ptp_offset_e2e;
+
+                        if (corr > PTP_PHASE_HARD_STEP_LIMIT_NS)
+                        {
+                            corr = PTP_PHASE_HARD_STEP_LIMIT_NS;
+                        }
+                        else if (corr < -PTP_PHASE_HARD_STEP_LIMIT_NS)
+                        {
+                            corr = -PTP_PHASE_HARD_STEP_LIMIT_NS;
+                        }
+
+                        if (PTP_ApplyTimeUpdateNs(corr) != 0U)
+                        {
+                            ptp_phase_step_count++;
+                            ptp_last_update_ns = corr;
+                            PTP_ServoReset();
+                            offset_avg = 0;
+                            ptp_phase_holdoff = 12U;
+                        }
+                    }
+                    /* 3) Небольшая, но устойчивая фазовая ошибка -> мягкий trim */
+                    else
+                    {
+                        if (ptp_phase_holdoff != 0U)
+                        {
+                            ptp_phase_holdoff--;
+                        }
+                        else if (ptp_freq_lock_count >= PTP_FREQ_LOCK_MIN_CYCLES)
+                        {
+                            if (PTP_Abs64(offset_avg) > PTP_PHASE_CAPTURE_THRESHOLD_NS)
+                            {
+                                corr = -(offset_avg * PTP_PHASE_CAPTURE_NUM) / PTP_PHASE_CAPTURE_DEN;
+
+                                if (corr > PTP_PHASE_CAPTURE_LIMIT_NS)
+                                {
+                                    corr = PTP_PHASE_CAPTURE_LIMIT_NS;
+                                }
+                                else if (corr < -PTP_PHASE_CAPTURE_LIMIT_NS)
+                                {
+                                    corr = -PTP_PHASE_CAPTURE_LIMIT_NS;
+                                }
+
+                                if (PTP_ApplyTimeUpdateNs(corr) != 0U)
+                                {
+                                    ptp_phase_step_count++;
+                                    ptp_last_update_ns = corr;
+                                    offset_avg = 0;
+                                    ptp_phase_holdoff = PTP_PHASE_HOLDOFF_CYCLES;
+                                    ptp_freq_servo_locked = 0U;
+                                    ptp_freq_lock_count = 0U;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -702,6 +811,140 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_local)
         HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
     }
 }
+
+static int64_t PTP_Abs64(int64_t v)
+{
+    return (v < 0) ? -v : v;
+}
+
+static void PTP_ServoReset(void)
+{
+    ptp_freq_servo_locked = 0U;
+    ptp_master_time_prev  = 0;
+    ptp_slave_time_prev   = 0;
+    ptp_master_count      = 0;
+    ptp_slave_count       = 0;
+    ptp_clock_diff        = 0;
+    ptp_freq_err_ppb      = 0;
+    ptp_last_addend_step  = 0;
+    ptp_freq_lock_count   = 0U;
+    ptp_phase_holdoff	  = 0U;
+}
+
+static uint8_t PTP_ApplyAddendFiltered(int64_t delta_addend)
+{
+    int64_t new_addend;
+    int64_t min_addend;
+    int64_t max_addend;
+
+    if (delta_addend > PTP_FREQ_ADDEND_STEP_MAX)
+    {
+        delta_addend = PTP_FREQ_ADDEND_STEP_MAX;
+    }
+    else if (delta_addend < -PTP_FREQ_ADDEND_STEP_MAX)
+    {
+        delta_addend = -PTP_FREQ_ADDEND_STEP_MAX;
+    }
+
+    min_addend = (int64_t)ptp_default_addend - PTP_FREQ_ADDEND_OFFSET_MAX;
+    max_addend = (int64_t)ptp_default_addend + PTP_FREQ_ADDEND_OFFSET_MAX;
+
+    new_addend = (int64_t)ptp_current_addend + delta_addend;
+
+    if (new_addend < min_addend)
+    {
+        new_addend = min_addend;
+    }
+    else if (new_addend > max_addend)
+    {
+        new_addend = max_addend;
+    }
+
+    ptp_last_addend_step = delta_addend;
+
+    if ((uint32_t)new_addend == ptp_current_addend)
+    {
+        return 1U;
+    }
+
+    if (PTP_ApplyAddend((uint32_t)new_addend) != 0U)
+    {
+        ptp_freq_update_count++;
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static void PTP_UpdateFrequencyServo(int64_t master_time_now, int64_t slave_time_now)
+{
+    int64_t master_count;
+    int64_t slave_count;
+    int64_t clock_diff;
+    int64_t delta_addend;
+    int64_t abs_offset;
+    uint32_t freq_shift;
+
+    if (ptp_freq_servo_locked == 0U)
+    {
+        ptp_master_time_prev = master_time_now;
+        ptp_slave_time_prev  = slave_time_now;
+        ptp_freq_servo_locked = 1U;
+        return;
+    }
+
+    master_count = master_time_now - ptp_master_time_prev;
+    slave_count  = slave_time_now  - ptp_slave_time_prev;
+
+    ptp_master_time_prev = master_time_now;
+    ptp_slave_time_prev  = slave_time_now;
+
+    if ((master_count < PTP_FREQ_MIN_CYCLE_NS) || (slave_count < PTP_FREQ_MIN_CYCLE_NS))
+    {
+        return;
+    }
+
+    if (slave_count <= 0)
+    {
+        return;
+    }
+
+    clock_diff = master_count - slave_count;
+
+    ptp_master_count = master_count;
+    ptp_slave_count  = slave_count;
+    ptp_clock_diff   = clock_diff;
+    ptp_freq_err_ppb = (clock_diff * 1000000000LL) / slave_count;
+
+    abs_offset = PTP_Abs64(ptp_offset_e2e);
+
+    /* около нуля addend лучше лишний раз не дёргать */
+    if ((abs_offset < PTP_FREQ_DEADBAND_OFFSET_NS) &&
+        (PTP_Abs64(ptp_freq_err_ppb) < PTP_FREQ_DEADBAND_PPB))
+    {
+        ptp_last_addend_step = 0;
+        return;
+    }
+
+    if (abs_offset > PTP_FREQ_FAST_ZONE_NS)
+    {
+        freq_shift = PTP_FREQ_SHIFT_FAST;
+    }
+    else if (abs_offset > PTP_FREQ_MEDIUM_ZONE_NS)
+    {
+        freq_shift = PTP_FREQ_SHIFT_MEDIUM;
+    }
+    else
+    {
+        freq_shift = PTP_FREQ_SHIFT_SLOW;
+    }
+
+    delta_addend = ((int64_t)ptp_current_addend * clock_diff) / slave_count;
+    delta_addend >>= freq_shift;
+
+    (void)PTP_ApplyAddendFiltered(delta_addend);
+}
+
 /* USER CODE END 0 */
 
 /**
