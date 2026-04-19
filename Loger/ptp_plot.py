@@ -10,6 +10,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
+def get_int(row, key, default=0):
+    value = row.get(key, "")
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
 def load_csv(csv_file: str):
     data = {
         "sample": [],
@@ -23,22 +30,28 @@ def load_csv(csv_file: str):
         "freq_update_count": [],
         "sync_rx_ts_valid_count": [],
         "tx_ts_seen": [],
+        "pi_prop_ppb": [],
+        "pi_integral_ppb": [],
+        "pi_output_ppb": [],
     }
 
     with open(csv_file, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            data["sample"].append(int(row["sample"]))
-            data["offset_ns"].append(int(row["offset_ns"]))
-            data["offset_avg_ns"].append(int(row["offset_avg_ns"]))
-            data["mean_path_delay_ns"].append(int(row["mean_path_delay_ns"]))
-            data["freq_err_ppb"].append(int(row["freq_err_ppb"]))
-            data["current_addend"].append(int(row["current_addend"]))
-            data["last_addend_step"].append(int(row["last_addend_step"]))
-            data["phase_step_count"].append(int(row["phase_step_count"]))
-            data["freq_update_count"].append(int(row["freq_update_count"]))
-            data["sync_rx_ts_valid_count"].append(int(row["sync_rx_ts_valid_count"]))
-            data["tx_ts_seen"].append(int(row["tx_ts_seen"]))
+            data["sample"].append(get_int(row, "sample"))
+            data["offset_ns"].append(get_int(row, "offset_ns"))
+            data["offset_avg_ns"].append(get_int(row, "offset_avg_ns"))
+            data["mean_path_delay_ns"].append(get_int(row, "mean_path_delay_ns"))
+            data["freq_err_ppb"].append(get_int(row, "freq_err_ppb"))
+            data["current_addend"].append(get_int(row, "current_addend"))
+            data["last_addend_step"].append(get_int(row, "last_addend_step"))
+            data["phase_step_count"].append(get_int(row, "phase_step_count"))
+            data["freq_update_count"].append(get_int(row, "freq_update_count"))
+            data["sync_rx_ts_valid_count"].append(get_int(row, "sync_rx_ts_valid_count"))
+            data["tx_ts_seen"].append(get_int(row, "tx_ts_seen"))
+            data["pi_prop_ppb"].append(get_int(row, "pi_prop_ppb"))
+            data["pi_integral_ppb"].append(get_int(row, "pi_integral_ppb"))
+            data["pi_output_ppb"].append(get_int(row, "pi_output_ppb"))
 
     return data
 
@@ -85,6 +98,9 @@ def add_summary_tab(notebook: ttk.Notebook, data):
     mpd_min, mpd_max = minmax(data["mean_path_delay_ns"])
     freq_min, freq_max = minmax(data["freq_err_ppb"])
     addend_min, addend_max = minmax(data["current_addend"])
+    pi_prop_min, pi_prop_max = minmax(data["pi_prop_ppb"])
+    pi_int_min, pi_int_max = minmax(data["pi_integral_ppb"])
+    pi_out_min, pi_out_max = minmax(data["pi_output_ppb"])
 
     summary = f"""CSV summary
 
@@ -112,6 +128,18 @@ current_addend:
   min = {addend_min}
   max = {addend_max}
 
+pi_prop_ppb:
+  min = {pi_prop_min}
+  max = {pi_prop_max}
+
+pi_integral_ppb:
+  min = {pi_int_min}
+  max = {pi_int_max}
+
+pi_output_ppb:
+  min = {pi_out_min}
+  max = {pi_out_max}
+
 Final values:
   offset_ns = {data["offset_ns"][-1]}
   offset_avg_ns = {data["offset_avg_ns"][-1]}
@@ -123,6 +151,9 @@ Final values:
   freq_update_count = {data["freq_update_count"][-1]}
   sync_rx_ts_valid_count = {data["sync_rx_ts_valid_count"][-1]}
   tx_ts_seen = {data["tx_ts_seen"][-1]}
+  pi_prop_ppb = {data["pi_prop_ppb"][-1]}
+  pi_integral_ppb = {data["pi_integral_ppb"][-1]}
+  pi_output_ppb = {data["pi_output_ppb"][-1]}
 """
     text.insert("1.0", summary)
     text.configure(state="disabled")
@@ -157,6 +188,9 @@ def main():
     add_plot_tab(notebook, "Freq Update Count", x, data["freq_update_count"], "freq_update_count")
     add_plot_tab(notebook, "RX Timestamp Count", x, data["sync_rx_ts_valid_count"], "sync_rx_ts_valid_count")
     add_plot_tab(notebook, "TX Timestamp Count", x, data["tx_ts_seen"], "tx_ts_seen")
+    add_plot_tab(notebook, "PI Prop", x, data["pi_prop_ppb"], "pi_prop_ppb")
+    add_plot_tab(notebook, "PI Integral", x, data["pi_integral_ppb"], "pi_integral_ppb")
+    add_plot_tab(notebook, "PI Output", x, data["pi_output_ppb"], "pi_output_ppb")
 
     root.mainloop()
 
