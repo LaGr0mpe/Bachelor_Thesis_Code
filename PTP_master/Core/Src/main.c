@@ -47,7 +47,7 @@ typedef struct
 
 #define ETH_RX_BUFFER_SIZE          1524U
 #define PTP_WAIT_LOOP               1000000U
-#define PTP_SYNC_PERIOD_MS          1000U
+#define PTP_SYNC_PERIOD_MS          125U
 
 #define PTP_HCLK_HZ                 216000000ULL
 #define PTP_SUBSEC_INCREMENT_NS     5ULL
@@ -608,6 +608,7 @@ int main(void)
     HAL_NVIC_EnableIRQ(ETH_IRQn);
 
     PTP_MasterHwInit();
+    ETH->PTPPPSCR = 0x0U;   /* PPS = 1 Hz */
 
     if (HAL_ETH_Start_IT(&heth) != HAL_OK)
     {
@@ -729,9 +730,9 @@ static void MX_ETH_Init(void)
   }
 
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
-  TxConfig.Attributes   = ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
-  TxConfig.CRCPadCtrl   = ETH_CRC_PAD_INSERT;
+  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
+  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
   /* USER CODE BEGIN ETH_Init 2 */
 
   /* USER CODE END ETH_Init 2 */

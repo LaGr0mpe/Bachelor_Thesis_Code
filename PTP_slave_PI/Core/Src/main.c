@@ -19,7 +19,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "string.h"
-#include "stdio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -269,7 +268,6 @@ static void MX_DMA_Init(void);
 static void MX_ETH_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
-static uint8_t PTP_TryReadTxTimestamp(void);
 /* USER CODE BEGIN PFP */
 static void PTP_HW_Init(void);
 static void PTP_Process(void);
@@ -1279,6 +1277,7 @@ int main(void)
   __HAL_ETH_DMA_ENABLE_IT(&heth, ETH_DMA_IT_T);
 
   PTP_HW_Init();
+  ETH->PTPPPSCR = 0x0U;   /* 1 Hz PPS */
 
   const char *hdr =
       "FMT,sample,offset_ns,raw_offset_ns,offset_avg_ns,mean_path_delay_ns,freq_err_ppb,current_addend,last_addend_step,phase_step_count,phase_capture_step_count,freq_update_count,coarse_mode,sync_rx_ts_valid_count,tx_ts_seen,pi_prop_ppb,pi_integral_ppb,pi_output_ppb,last_sample_rejected,rejected_sample_count,reject_mpd_count,reject_abs_offset_count,reject_jump_count\r\n";
@@ -1391,7 +1390,7 @@ static void MX_ETH_Init(void)
   heth.Init.MediaInterface = HAL_ETH_RMII_MODE;
   heth.Init.TxDesc = DMATxDscrTab;
   heth.Init.RxDesc = DMARxDscrTab;
-  heth.Init.RxBuffLen = ETH_RX_BUFFER_SIZE;
+  heth.Init.RxBuffLen = 1524;
 
   /* USER CODE BEGIN MACADDRESS */
 
@@ -1402,13 +1401,10 @@ static void MX_ETH_Init(void)
     Error_Handler();
   }
 
-  ETH->DMABMR |= ETH_DMABMR_AAB;
-  ETH->DMABMR |= ETH_DMABMR_EDE;
-
   memset(&TxConfig, 0 , sizeof(ETH_TxPacketConfig));
-  TxConfig.Attributes   = ETH_TX_PACKETS_FEATURES_CRCPAD;
-  TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
-  TxConfig.CRCPadCtrl   = ETH_CRC_PAD_INSERT;
+  TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CSUM | ETH_TX_PACKETS_FEATURES_CRCPAD;
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_IPHDR_PAYLOAD_INSERT_PHDR_CALC;
+  TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
   /* USER CODE BEGIN ETH_Init 2 */
 
   /* USER CODE END ETH_Init 2 */
