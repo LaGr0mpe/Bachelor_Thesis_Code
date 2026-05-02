@@ -19,12 +19,10 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "string.h"
-#include "stdio.h"
-
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -60,7 +58,6 @@ typedef struct
 #define SLAVE_ID_LAST_BYTE                  0x00U //Slave 1
 //#define SLAVE_ID_LAST_BYTE                  0x02U //Slave 2
 //don't use 01 for slave. It is master's number
-
 
 
 #define PTP_SYNC                               0U
@@ -149,7 +146,7 @@ typedef struct
 
 #define PTP_CONSECUTIVE_REJECT_LIMIT          64U
 
-#define PTP_DELAYREQ_TIMEOUT_MS              500U
+#define PTP_DELAYREQ_TIMEOUT_MS              100U
 
 /* USER CODE END PD */
 
@@ -193,6 +190,11 @@ uint8_t delay_req_frame[58];
 static const uint8_t g_slave_mac[6] =
 {
     0x00, 0x80, 0xE1, 0x00, 0x00, SLAVE_ID_LAST_BYTE
+};
+
+static const uint8_t g_ptp_multicast_mac[6] =
+{
+    0x01, 0x1B, 0x19, 0x00, 0x00, 0x00
 };
 
 static const uint8_t g_slave_port_identity[10] =
@@ -285,7 +287,7 @@ volatile uint8_t  ptp_coarse_mode      = 1U;
 volatile uint8_t  ptp_phase_capture_count      = 0U;
 volatile uint32_t ptp_phase_capture_step_count = 0U;
 
-static char ptp_log_buf[384];
+static char ptp_log_buf[448];
 static uint32_t ptp_last_logged_delayresp = 0U;
 
 volatile int64_t  ptp_raw_offset_e2e           = 0;
@@ -338,6 +340,7 @@ static void PTP_LogSampleIfReady(void);
 static void PTP_CheckDelayReqTimeout(void);
 static void PTP_HandleRxFrame(ETH_HandleTypeDef *heth_local, uint8_t *buf);
 static void PTP_ForceResync(void);
+static void ETH_SetMacAddressFilter1(const uint8_t *mac);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -566,13 +569,36 @@ static uint32_t PTP_ParseNanoseconds(const uint8_t *ts)
            ((uint32_t)ts[9]);
 }
 
+static void ETH_SetMacAddressFilter1(const uint8_t *mac)
+{
+    /*
+     * MAC address filter slot 1.
+     * Address byte order follows STM32 ETH MACA register layout:
+     * MACA1LR = bytes 0..3
+     * MACA1HR = bytes 4..5 + AE bit
+     */
+    ETH->MACA1LR =
+        ((uint32_t)mac[0])       |
+        ((uint32_t)mac[1] << 8)  |
+        ((uint32_t)mac[2] << 16) |
+        ((uint32_t)mac[3] << 24);
+
+    ETH->MACA1HR =
+        ((uint32_t)mac[4])      |
+        ((uint32_t)mac[5] << 8) |
+        (1UL << 31);            /* AE: address enable */
+}
+
 static void PTP_HW_Init(void)
 {
     uint32_t ptptscr = 0U;
 
     //ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
-    ETH->MACFFR &= ~(ETH_MACFFR_RA | ETH_MACFFR_PM);
-    ETH->MACFFR |= ETH_MACFFR_PAM;
+    //ETH->MACFFR &= ~(ETH_MACFFR_RA | ETH_MACFFR_PM);
+    //ETH->MACFFR |= ETH_MACFFR_PAM;
+    ETH->MACFFR &= ~(ETH_MACFFR_RA | ETH_MACFFR_PM | ETH_MACFFR_PAM);
+    ETH_SetMacAddressFilter1(g_ptp_multicast_mac);
+
 
     ETH->MACIMR |= (1UL << 9);
     ETH->PTPSSIR = (uint32_t)PTP_SUBSEC_INCREMENT_NS;
@@ -821,8 +847,7 @@ static void PTP_Process(void)
                      * re-entry, do NOT reject it here — let the hysteresis logic handle it.
                      */
                     else if ((ptp_coarse_mode == 0U) &&
-                             (abs_raw_offset > PTP_REJECT_FINE_OFFSET_ABS_NS) &&
-                             (abs_raw_offset < PTP_PHASE_COARSE_ENTER_NS))
+                             (abs_raw_offset > PTP_REJECT_FINE_OFFSET_ABS_NS))
                     {
                         reject_sample = 1U;
                         ptp_reject_abs_offset_count++;
@@ -833,7 +858,6 @@ static void PTP_Process(void)
                      */
                     else if ((ptp_coarse_mode == 0U) &&
                              (ptp_have_good_sample != 0U) &&
-                             (abs_raw_offset < PTP_PHASE_COARSE_ENTER_NS) &&
                              (PTP_Abs64(raw_offset_e2e - ptp_last_good_raw_offset_e2e) > PTP_REJECT_FINE_OFFSET_DELTA_NS))
                     {
                         reject_sample = 1U;
@@ -1387,7 +1411,7 @@ static void PTP_LogSampleIfReady(void)
     len = snprintf(
         ptp_log_buf,
         sizeof(ptp_log_buf),
-		"DATA,%lu,%ld,%ld,%ld,%ld,%ld,%lu,%ld,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%ld,%ld,%ld,%u,%lu,%lu,%lu,%lu\r\n",
+		"DATA,%lu,%ld,%ld,%ld,%ld,%ld,%lu,%ld,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%ld,%ld,%ld,%u,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
         (unsigned long)delayresp_count,
         (long)ptp_offset_ns,
         (long)ptp_raw_offset_e2e,
@@ -1411,7 +1435,9 @@ static void PTP_LogSampleIfReady(void)
         (unsigned long)ptp_rejected_sample_count,
         (unsigned long)ptp_reject_mpd_count,
         (unsigned long)ptp_reject_abs_offset_count,
-        (unsigned long)ptp_reject_jump_count
+        (unsigned long)ptp_reject_jump_count,
+		(unsigned long)ptp_consecutive_reject_count,
+		(unsigned long)ptp_resync_count
     );
 
     if (len > 0)
@@ -1470,7 +1496,8 @@ int main(void)
   ETH->PTPPPSCR = 0x0U;   /* 1 Hz PPS */
 
   const char *hdr =
-		  "FMT,sample,offset_ns,raw_offset_ns,offset_avg_ns,mean_path_delay_ns,freq_err_ppb,current_addend,last_addend_step,phase_step_count,phase_capture_step_count,freq_update_count,coarse_mode,sync_rx_ts_valid_count,tx_ts_seen,delayreq_timeout_count,delayresp_ignored_count,pi_prop_ppb,pi_integral_ppb,pi_output_ppb,last_sample_rejected,rejected_sample_count,reject_mpd_count,reject_abs_offset_count,reject_jump_count\r\n";
+      "FMT,sample,offset_ns,raw_offset_ns,offset_avg_ns,mean_path_delay_ns,freq_err_ppb,current_addend,last_addend_step,phase_step_count,phase_capture_step_count,freq_update_count,coarse_mode,sync_rx_ts_valid_count,tx_ts_seen,delayreq_timeout_count,delayresp_ignored_count,pi_prop_ppb,pi_integral_ppb,pi_output_ppb,last_sample_rejected,rejected_sample_count,reject_mpd_count,reject_abs_offset_count,reject_jump_count,consecutive_reject_count,resync_count\r\n";
+
   HAL_UART_Transmit(&huart3, (uint8_t *)hdr, (uint16_t)strlen(hdr), 100);
 
   /* USER CODE END 2 */

@@ -54,6 +54,8 @@ FIELDNAMES = [
     "reject_mpd_count",
     "reject_abs_offset_count",
     "reject_jump_count",
+    "consecutive_reject_count",
+    "resync_count",
 ]
 
 EXPECTED_PARTS = 1 + len(FIELDNAMES)

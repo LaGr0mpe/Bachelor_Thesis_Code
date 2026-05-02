@@ -145,6 +145,11 @@ static const uint8_t g_master_port_identity[10] =
   0x00, 0x80, 0xE1, 0xFF, 0xFE, 0x00, 0x00, 0x01, 0x00, 0x01
 };
 
+static const uint8_t g_ptp_multicast_mac[6] =
+{
+  0x01, 0x1B, 0x19, 0x00, 0x00, 0x00
+};
+
 static uint32_t sync_tx_desc_idx = 0U;
 /* USER CODE END PV */
 
@@ -172,10 +177,25 @@ static uint8_t PTP_DelayReqQueuePush(const PTP_DelayReqEvent *evt);
 static uint8_t PTP_DelayReqQueuePeek(PTP_DelayReqEvent *evt);
 static void    PTP_DelayReqQueueDropFront(void);
 static uint8_t PTP_MasterSendFrameBlocking(uint8_t *frame, uint16_t length, uint32_t timeout_ms);
+static void ETH_SetMacAddressFilter1(const uint8_t *mac);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void ETH_SetMacAddressFilter1(const uint8_t *mac)
+{
+  ETH->MACA1LR =
+      ((uint32_t)mac[0])       |
+      ((uint32_t)mac[1] << 8)  |
+      ((uint32_t)mac[2] << 16) |
+      ((uint32_t)mac[3] << 24);
+
+  ETH->MACA1HR =
+      ((uint32_t)mac[4])      |
+      ((uint32_t)mac[5] << 8) |
+      (1UL << 31);
+}
 
 static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t timeout)
 {
@@ -349,7 +369,11 @@ static void PTP_MasterHwInit(void)
 
   ETH->DMABMR |= ETH_DMABMR_AAB;
   ETH->DMABMR |= ETH_DMABMR_EDE;
-  ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
+
+  //ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
+  ETH->MACFFR &= ~(ETH_MACFFR_RA | ETH_MACFFR_PM | ETH_MACFFR_PAM);
+  ETH_SetMacAddressFilter1(g_ptp_multicast_mac);
+
   ETH->PTPSSIR = (uint32_t)PTP_SUBSEC_INCREMENT_NS;
 
   ptptscr |= ETH_PTPTSCR_TSE;
