@@ -58,6 +58,10 @@ typedef struct
 
 #define PTP_MASTER_START_SEC        1774800000UL
 #define PTP_MASTER_START_NSEC       0UL
+
+#define PTP_DELAYREQ_QUEUE_LEN          16U
+#define PTP_DELAYRESP_TX_TIMEOUT_MS     10U
+#define PTP_DELAYRESP_PER_LOOP_LIMIT     4U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -122,7 +126,15 @@ volatile uint32_t ptp_current_addend = 0U;
 volatile uint32_t ptp_addend_update_count = 0U;
 volatile uint32_t ptp_reg_timeout_count = 0U;
 
-volatile PTP_DelayReqEvent g_delayreq_evt = {0};
+static PTP_DelayReqEvent g_delayreq_queue[PTP_DELAYREQ_QUEUE_LEN];
+
+volatile uint32_t g_delayreq_q_head = 0U;
+volatile uint32_t g_delayreq_q_tail = 0U;
+
+volatile uint32_t delayreq_queue_push_count = 0U;
+volatile uint32_t delayreq_queue_pop_count  = 0U;
+volatile uint32_t delayreq_queue_drop_count = 0U;
+volatile uint32_t delayresp_tx_fail_count   = 0U;
 
 static const uint8_t g_master_mac[6] = {0x00, 0x80, 0xE1, 0x00, 0x00, 0x01};
 static const uint8_t g_master_port_identity[10] =
@@ -152,6 +164,11 @@ static uint8_t PTP_MasterSendSync(void);
 static uint8_t PTP_MasterTryReadSyncTxTimestamp(void);
 static uint8_t PTP_MasterSendFollowUp(uint16_t seq_id, uint32_t sec_t1, uint32_t nsec_t1);
 static uint8_t PTP_MasterSendDelayResp(const PTP_DelayReqEvent *evt);
+
+static uint8_t PTP_DelayReqQueuePush(const PTP_DelayReqEvent *evt);
+static uint8_t PTP_DelayReqQueuePeek(PTP_DelayReqEvent *evt);
+static void    PTP_DelayReqQueueDropFront(void);
+static uint8_t PTP_MasterSendFrameBlocking(uint8_t *frame, uint16_t length, uint32_t timeout_ms);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -167,6 +184,91 @@ static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32
     }
   }
   return 0U;
+}
+
+static uint8_t PTP_DelayReqQueuePush(const PTP_DelayReqEvent *evt)
+{
+  uint32_t head = g_delayreq_q_head;
+  uint32_t next = head + 1U;
+
+  if (next >= PTP_DELAYREQ_QUEUE_LEN)
+  {
+    next = 0U;
+  }
+
+  if (next == g_delayreq_q_tail)
+  {
+    delayreq_queue_drop_count++;
+    return 0U;
+  }
+
+  g_delayreq_queue[head] = *evt;
+
+  /*
+   * Ensure event data is written before publishing new head.
+   * CMSIS intrinsic is available on STM32 projects.
+   */
+  __DMB();
+
+  g_delayreq_q_head = next;
+  delayreq_queue_push_count++;
+
+  return 1U;
+}
+
+static uint8_t PTP_DelayReqQueuePeek(PTP_DelayReqEvent *evt)
+{
+  uint32_t tail = g_delayreq_q_tail;
+
+  if (tail == g_delayreq_q_head)
+  {
+    return 0U;
+  }
+
+  __DMB();
+
+  *evt = g_delayreq_queue[tail];
+
+  return 1U;
+}
+
+static void PTP_DelayReqQueueDropFront(void)
+{
+  uint32_t tail = g_delayreq_q_tail;
+
+  if (tail == g_delayreq_q_head)
+  {
+    return;
+  }
+
+  tail++;
+
+  if (tail >= PTP_DELAYREQ_QUEUE_LEN)
+  {
+    tail = 0U;
+  }
+
+  __DMB();
+
+  g_delayreq_q_tail = tail;
+  delayreq_queue_pop_count++;
+}
+
+static uint8_t PTP_MasterSendFrameBlocking(uint8_t *frame, uint16_t length, uint32_t timeout_ms)
+{
+  ETH_BufferTypeDef txBuffer;
+
+  txBuffer.buffer = frame;
+  txBuffer.len    = length;
+  txBuffer.next   = NULL;
+
+  TxConfig.Attributes   = ETH_TX_PACKETS_FEATURES_CRCPAD;
+  TxConfig.ChecksumCtrl = ETH_CHECKSUM_DISABLE;
+  TxConfig.CRCPadCtrl   = ETH_CRC_PAD_INSERT;
+  TxConfig.Length       = length;
+  TxConfig.TxBuffer     = &txBuffer;
+
+  return (HAL_ETH_Transmit(&heth, &TxConfig, timeout_ms) == HAL_OK) ? 1U : 0U;
 }
 
 static uint32_t PTP_NsToSubsecUpdate(uint32_t ns)
@@ -438,12 +540,15 @@ static uint8_t PTP_MasterSendDelayResp(const PTP_DelayReqEvent *evt)
 {
   PTP_BuildDelayRespFrame(delayresp_frame, evt);
 
-  if (PTP_MasterSendFrame(delayresp_frame, sizeof(delayresp_frame)) != 0U)
+  if (PTP_MasterSendFrameBlocking(delayresp_frame,
+                                  sizeof(delayresp_frame),
+                                  PTP_DELAYRESP_TX_TIMEOUT_MS) != 0U)
   {
     delayresp_tx_count++;
     return 1U;
   }
 
+  delayresp_tx_fail_count++;
   return 0U;
 }
 
@@ -466,25 +571,34 @@ static void PTP_MasterHandlePtpRx(ETH_HandleTypeDef *heth_ptr, uint8_t *buf)
 
   if (ptp_message == PTP_DELAY_REQ)
   {
+    PTP_DelayReqEvent evt;
+
+    memset(&evt, 0, sizeof(evt));
+
     delayreq_rx_count++;
 
-    g_delayreq_evt.seq_id = ptp_seq_id;
-    memcpy((void *)g_delayreq_evt.req_port_identity, &buf[34], 10U);
-    memcpy((void *)g_delayreq_evt.dst_mac, &buf[6], 6U);
+    evt.seq_id = ptp_seq_id;
+    memcpy(evt.req_port_identity, &buf[34], 10U);
+    memcpy(evt.dst_mac, &buf[6], 6U);
 
-    /* On this setup, d[6]/d[7] carry the valid RX timestamp for Delay_Req. */
+    /*
+     * On this setup, d[6]/d[7] carry the valid RX timestamp for Delay_Req.
+     */
     if ((d[6] != 0U) || (d[7] != 0U))
     {
-      g_delayreq_evt.nsec = d[6];
-      g_delayreq_evt.sec  = d[7];
+      evt.nsec = d[6];
+      evt.sec  = d[7];
     }
     else
     {
-      g_delayreq_evt.sec  = ETH->PTPTSHR;
-      g_delayreq_evt.nsec = ETH->PTPTSLR;
+      evt.sec  = ETH->PTPTSHR;
+      evt.nsec = ETH->PTPTSLR;
     }
 
-    g_delayreq_evt.pending = 1U;
+    evt.pending = 1U;
+
+    (void)PTP_DelayReqQueuePush(&evt);
+
     HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
   }
 }
@@ -498,11 +612,26 @@ static void PTP_MasterProcess(void)
     (void)PTP_MasterSendFollowUp(followup_seq_id, followup_t1_sec, followup_t1_nsec);
   }
 
-  if (g_delayreq_evt.pending != 0U)
   {
-    if (PTP_MasterSendDelayResp((const PTP_DelayReqEvent *)&g_delayreq_evt) != 0U)
+    uint8_t resp_limit = PTP_DELAYRESP_PER_LOOP_LIMIT;
+
+    while (resp_limit-- != 0U)
     {
-      g_delayreq_evt.pending = 0U;
+      PTP_DelayReqEvent evt;
+
+      if (PTP_DelayReqQueuePeek(&evt) == 0U)
+      {
+        break;
+      }
+
+      if (PTP_MasterSendDelayResp(&evt) != 0U)
+      {
+        PTP_DelayReqQueueDropFront();
+      }
+      else
+      {
+        break;
+      }
     }
   }
 
