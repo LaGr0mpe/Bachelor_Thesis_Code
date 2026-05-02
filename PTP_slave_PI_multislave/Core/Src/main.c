@@ -57,8 +57,8 @@ typedef struct
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-//#define SLAVE_ID_LAST_BYTE                  0x00U //Slave 1
-#define SLAVE_ID_LAST_BYTE                  0x02U //Slave 2
+#define SLAVE_ID_LAST_BYTE                  0x00U //Slave 1
+//#define SLAVE_ID_LAST_BYTE                  0x02U //Slave 2
 //don't use 01 for slave. It is master's number
 
 
@@ -483,7 +483,10 @@ static void PTP_HW_Init(void)
 {
     uint32_t ptptscr = 0U;
 
-    ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
+    //ETH->MACFFR |= ETH_MACFFR_RA | ETH_MACFFR_PM;
+    ETH->MACFFR &= ~(ETH_MACFFR_RA | ETH_MACFFR_PM);
+    ETH->MACFFR |= ETH_MACFFR_PAM;
+
     ETH->MACIMR |= (1UL << 9);
     ETH->PTPSSIR = (uint32_t)PTP_SUBSEC_INCREMENT_NS;
 
