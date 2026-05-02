@@ -147,6 +147,10 @@ typedef struct
 #define PTP_REJECT_FINE_OFFSET_ABS_NS     3000000LL   /* 3 ms */
 #define PTP_REJECT_FINE_OFFSET_DELTA_NS    200000LL   /* 200 us jump vs previous good sample */
 
+#define PTP_CONSECUTIVE_REJECT_LIMIT          64U
+
+#define PTP_DELAYREQ_TIMEOUT_MS              500U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -206,6 +210,10 @@ volatile uint8_t  delayreq_pending = 0U;
 volatile uint8_t  delayreq_tx_ts_waiting = 0U;
 volatile uint8_t  ptp_request_delayreq = 0U;
 
+volatile uint32_t ptp_delayreq_sent_ms = 0U;
+volatile uint32_t ptp_delayreq_timeout_count = 0U;
+volatile uint32_t ptp_delayresp_ignored_count = 0U;
+
 volatile uint16_t sync_seq_id = 0U;
 volatile uint16_t delayreq_seq_id = 0U;
 
@@ -217,6 +225,12 @@ volatile uint32_t tx_t3_sec = 0U;
 volatile uint32_t tx_t3_nsec = 0U;
 volatile uint32_t resp_t4_sec = 0U;
 volatile uint32_t resp_t4_nsec = 0U;
+
+volatile uint16_t delayreq_ref_sync_seq_id = 0U;
+volatile uint32_t delayreq_ref_t1_sec = 0U;
+volatile uint32_t delayreq_ref_t1_nsec = 0U;
+volatile uint32_t delayreq_ref_t2_sec = 0U;
+volatile uint32_t delayreq_ref_t2_nsec = 0U;
 
 volatile int64_t t1 = 0;
 volatile int64_t t2 = 0;
@@ -271,7 +285,7 @@ volatile uint8_t  ptp_coarse_mode      = 1U;
 volatile uint8_t  ptp_phase_capture_count      = 0U;
 volatile uint32_t ptp_phase_capture_step_count = 0U;
 
-static char ptp_log_buf[320];
+static char ptp_log_buf[384];
 static uint32_t ptp_last_logged_delayresp = 0U;
 
 volatile int64_t  ptp_raw_offset_e2e           = 0;
@@ -283,6 +297,9 @@ volatile uint32_t ptp_rejected_sample_count    = 0U;
 volatile uint32_t ptp_reject_mpd_count         = 0U;
 volatile uint32_t ptp_reject_abs_offset_count  = 0U;
 volatile uint32_t ptp_reject_jump_count        = 0U;
+
+volatile uint32_t ptp_consecutive_reject_count = 0U;
+volatile uint32_t ptp_resync_count = 0U;
 
 
 
@@ -318,10 +335,80 @@ static void PTP_UpdateFrequencyServo(int64_t master_time_now, int64_t slave_time
 static void PTP_FineServoRearm(void);
 static int64_t  PTP_ScaledToPpb(int64_t scaled_ppb);
 static void PTP_LogSampleIfReady(void);
+static void PTP_CheckDelayReqTimeout(void);
+static void PTP_HandleRxFrame(ETH_HandleTypeDef *heth_local, uint8_t *buf);
+static void PTP_ForceResync(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void PTP_ForceResync(void)
+{
+    __disable_irq();
+    g_sync_evt.pending = 0U;
+    g_follow_evt.pending = 0U;
+    g_delayresp_evt.pending = 0U;
+    __enable_irq();
+
+    ptp_synced = 0U;
+    sync_received = 0U;
+
+    delayreq_pending = 0U;
+    delayreq_tx_ts_waiting = 0U;
+    ptp_request_delayreq = 0U;
+
+    ptp_delayreq_sent_ms = 0U;
+
+    tx_t3_sec = 0U;
+    tx_t3_nsec = 0U;
+
+    delayreq_ref_sync_seq_id = 0U;
+    delayreq_ref_t1_sec = 0U;
+    delayreq_ref_t1_nsec = 0U;
+    delayreq_ref_t2_sec = 0U;
+    delayreq_ref_t2_nsec = 0U;
+
+    offset_avg = 0;
+    ptp_coarse_mode = 1U;
+
+    PTP_ServoReset();
+
+    ptp_consecutive_reject_count = 0U;
+    ptp_resync_count++;
+}
+
+static void PTP_CheckDelayReqTimeout(void)
+{
+    if (delayreq_pending == 0U)
+    {
+        return;
+    }
+
+    if ((uint32_t)(HAL_GetTick() - ptp_delayreq_sent_ms) < PTP_DELAYREQ_TIMEOUT_MS)
+    {
+        return;
+    }
+
+    /*
+     * Delay_Req was sent, but matching Delay_Resp did not arrive in time.
+     * Drop this exchange and wait for the next Sync/Follow_Up cycle.
+     */
+    delayreq_pending = 0U;
+    delayreq_tx_ts_waiting = 0U;
+    ptp_request_delayreq = 0U;
+
+    tx_t3_sec = 0U;
+    tx_t3_nsec = 0U;
+
+    delayreq_ref_sync_seq_id = 0U;
+    delayreq_ref_t1_sec = 0U;
+    delayreq_ref_t1_nsec = 0U;
+    delayreq_ref_t2_sec = 0U;
+    delayreq_ref_t2_nsec = 0U;
+
+    ptp_delayreq_timeout_count++;
+}
 
 static uint8_t PTP_WaitRegBitClear(volatile uint32_t *reg, uint32_t mask, uint32_t loops)
 {
@@ -579,6 +666,7 @@ static void PTP_SendDelayReq(void)
     {
         delayreq_pending = 1U;
         delayreq_tx_ts_waiting = 1U;
+        ptp_delayreq_sent_ms = HAL_GetTick();
     }
     else
     {
@@ -634,19 +722,42 @@ static void PTP_Process(void)
         {
             if (ptp_synced == 0U)
             {
-            	if (PTP_ApplyTimeInitialize(follow_sec, follow_nsec) != 0U)
-            	{
-            	    ptp_synced = 1U;
-            	    offset_avg = 0;
-            	    ptp_coarse_mode = 1U;
-            	    PTP_ServoReset();
-            	}
+                if (PTP_ApplyTimeInitialize(follow_sec, follow_nsec) != 0U)
+                {
+                    ptp_synced = 1U;
+                    offset_avg = 0;
+                    ptp_coarse_mode = 1U;
+                    PTP_ServoReset();
+                }
             }
 
-            if ((ptp_synced != 0U) && (delayreq_pending == 0U))
+            /*
+             * Freeze the exact Sync/Follow_Up pair that will be used for the
+             * upcoming Delay_Req exchange.
+             *
+             * This prevents a later Sync from overwriting t2 while we are still
+             * waiting for the Delay_Resp of the previous exchange.
+             */
+            if ((ptp_synced != 0U) &&
+                (delayreq_pending == 0U) &&
+                (ptp_request_delayreq == 0U))
             {
+                delayreq_ref_sync_seq_id = sync_seq_id;
+
+                delayreq_ref_t1_sec  = follow_sec;
+                delayreq_ref_t1_nsec = follow_nsec;
+
+                delayreq_ref_t2_sec  = sync_rx_sec;
+                delayreq_ref_t2_nsec = sync_rx_nsec;
+
                 ptp_request_delayreq = 1U;
             }
+
+            /*
+             * This Sync/Follow_Up pair has been consumed.
+             * A new Delay_Req must only use a new matched pair.
+             */
+            sync_received = 0U;
         }
 
         g_follow_evt.pending = 0U;
@@ -663,13 +774,15 @@ static void PTP_Process(void)
         resp_t4_sec  = g_delayresp_evt.sec;
         resp_t4_nsec = g_delayresp_evt.nsec;
 
-        if ((g_delayresp_evt.seq_id == delayreq_seq_id) &&
+        if ((delayreq_pending != 0U) &&
+            (g_delayresp_evt.seq_id == delayreq_seq_id) &&
             (memcmp((const void *)g_delayresp_evt.requesting_port_identity,
                     g_slave_port_identity,
                     10U) == 0))
         {
             delayresp_count++;
             delayreq_pending = 0U;
+            ptp_delayreq_sent_ms = 0U;
 
             if (((tx_t3_sec != 0U) || (tx_t3_nsec != 0U)) && (delayreq_tx_ts_waiting == 0U))
             {
@@ -678,8 +791,8 @@ static void PTP_Process(void)
                 int64_t corr;
                 int64_t raw_offset_e2e;
 
-                t1 = PTP_ToNs(follow_sec, follow_nsec);
-                t2 = PTP_ToNs(sync_rx_sec, sync_rx_nsec);
+                t1 = PTP_ToNs(delayreq_ref_t1_sec, delayreq_ref_t1_nsec);
+                t2 = PTP_ToNs(delayreq_ref_t2_sec, delayreq_ref_t2_nsec);
                 t3 = PTP_ToNs(tx_t3_sec, tx_t3_nsec);
                 t4 = PTP_ToNs(resp_t4_sec, resp_t4_nsec);
 
@@ -731,12 +844,32 @@ static void PTP_Process(void)
                     {
                         ptp_rejected_sample_count++;
                         ptp_last_sample_rejected = 1U;
+
+                        if (ptp_consecutive_reject_count < 0xFFFFFFFFUL)
+                        {
+                            ptp_consecutive_reject_count++;
+                        }
+
+                        if (ptp_consecutive_reject_count >= PTP_CONSECUTIVE_REJECT_LIMIT)
+                        {
+                            PTP_ForceResync();
+
+                            /*
+                             * PTP_ForceResync() calls PTP_ServoReset(), which clears this flag.
+                             * Restore it so the current logged sample still shows rejection.
+                             */
+                            ptp_last_sample_rejected = 1U;
+                        }
+
                         g_delayresp_evt.pending = 0U;
                         return;
                     }
                 }
+
                 ptp_last_good_raw_offset_e2e = raw_offset_e2e;
                 ptp_have_good_sample = 1U;
+
+                ptp_consecutive_reject_count = 0U;
 
                 ptp_offset_e2e = raw_offset_e2e + PTP_STATIC_OFFSET_BIAS_NS;
                 ptp_offset     = ptp_offset_e2e;
@@ -881,6 +1014,10 @@ static void PTP_Process(void)
                 }
             }
         }
+        else
+        {
+            ptp_delayresp_ignored_count++;
+        }
 
         g_delayresp_evt.pending = 0U;
     }
@@ -920,103 +1057,118 @@ void HAL_ETH_TxFreeCallback(uint32_t *buff)
     (void)buff;
 }
 
-void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_local)
+static void PTP_HandleRxFrame(ETH_HandleTypeDef *heth_local, uint8_t *buf)
 {
-    uint8_t *buf = NULL;
+    uint16_t eth_type;
+    uint8_t  ptp_message;
+    uint16_t ptp_seq_id;
+    uint32_t rx_sec;
+    uint32_t rx_nsec;
+    uint32_t idx;
+    ETH_DMADescTypeDef *desc;
+    uint32_t *d;
+    uint8_t rx_hw_valid = 0U;
+    uint32_t rx_hw_sec = 0U;
+    uint32_t rx_hw_nsec = 0U;
 
-    if (HAL_ETH_ReadData(heth_local, (void **)&buf) == HAL_OK)
+    eth_type = ((uint16_t)buf[12] << 8) | buf[13];
+    rx_sec   = ETH->PTPTSHR;
+    rx_nsec  = ETH->PTPTSLR;
+
+    if (eth_type != 0x88F7U)
     {
-        uint16_t eth_type;
-        uint8_t  ptp_message;
-        uint16_t ptp_seq_id;
-        uint32_t rx_sec;
-        uint32_t rx_nsec;
-        uint32_t idx;
-        ETH_DMADescTypeDef *desc;
-        uint32_t *d;
-        uint8_t rx_hw_valid = 0U;
-        uint32_t rx_hw_sec = 0U;
-        uint32_t rx_hw_nsec = 0U;
+        return;
+    }
 
-        eth_type = ((uint16_t)buf[12] << 8) | buf[13];
-        rx_sec   = ETH->PTPTSHR;
-        rx_nsec  = ETH->PTPTSLR;
+    ptp_message = buf[14] & 0x0FU;
+    ptp_seq_id  = ((uint16_t)buf[44] << 8) | buf[45];
 
-        if (eth_type != 0x88F7U)
+    idx = heth_local->RxDescList.RxDescIdx;
+    idx = (idx == 0U) ? (ETH_RX_DESC_CNT - 1U) : (idx - 1U);
+
+    desc = (ETH_DMADescTypeDef *)heth_local->RxDescList.RxDesc[idx];
+    d = (uint32_t *)desc;
+
+    if ((d[6] != 0U) || (d[7] != 0U))
+    {
+        rx_hw_nsec = d[6];
+        rx_hw_sec  = d[7];
+        rx_hw_valid = 1U;
+    }
+
+    if (ptp_message == PTP_SYNC)
+    {
+        g_sync_evt.seq_id = ptp_seq_id;
+
+        if (rx_hw_valid != 0U)
+        {
+            g_sync_evt.sec  = rx_hw_sec;
+            g_sync_evt.nsec = rx_hw_nsec;
+            sync_rx_ts_valid_count++;
+        }
+        else
+        {
+            g_sync_evt.sec  = rx_sec;
+            g_sync_evt.nsec = rx_nsec;
+        }
+
+        __DMB();
+        g_sync_evt.pending = 1U;
+    }
+    else if (ptp_message == PTP_FOLLOW_UP)
+    {
+        const uint8_t *ts = &buf[48];
+
+        g_follow_evt.seq_id = ptp_seq_id;
+        g_follow_evt.sec    = PTP_ParseSecondsLow32(ts);
+        g_follow_evt.nsec   = PTP_ParseNanoseconds(ts);
+
+        __DMB();
+        g_follow_evt.pending = 1U;
+    }
+    else if (ptp_message == PTP_DELAY_RESP)
+    {
+        const uint8_t *ts = &buf[48];
+
+        if (memcmp(&buf[0], g_slave_mac, 6U) != 0)
         {
             return;
         }
 
-        ptp_message = buf[14] & 0x0FU;
-        ptp_seq_id  = ((uint16_t)buf[44] << 8) | buf[45];
-
-        idx = heth_local->RxDescList.RxDescIdx;
-        idx = (idx == 0U) ? (ETH_RX_DESC_CNT - 1U) : (idx - 1U);
-
-        desc = (ETH_DMADescTypeDef *)heth_local->RxDescList.RxDesc[idx];
-        d = (uint32_t *)desc;
-
-        /* For received PTP event frames on this setup, d[6]/d[7] carry the valid RX timestamp. */
-        if ((d[6] != 0U) || (d[7] != 0U))
+        if (memcmp(&buf[58], g_slave_port_identity, 10U) != 0)
         {
-            rx_hw_nsec = d[6];
-            rx_hw_sec  = d[7];
-            rx_hw_valid = 1U;
+            return;
         }
 
-        if (ptp_message == PTP_SYNC)
+        g_delayresp_evt.seq_id = ptp_seq_id;
+        g_delayresp_evt.sec    = PTP_ParseSecondsLow32(ts);
+        g_delayresp_evt.nsec   = PTP_ParseNanoseconds(ts);
+        memcpy((void *)g_delayresp_evt.requesting_port_identity, &buf[58], 10U);
+
+        __DMB();
+        g_delayresp_evt.pending = 1U;
+    }
+
+    HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+}
+
+void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_local)
+{
+    while (1)
+    {
+        uint8_t *buf = NULL;
+
+        if (HAL_ETH_ReadData(heth_local, (void **)&buf) != HAL_OK)
         {
-            g_sync_evt.pending = 1U;
-            g_sync_evt.seq_id  = ptp_seq_id;
-
-            if (rx_hw_valid != 0U)
-            {
-                g_sync_evt.sec  = rx_hw_sec;
-                g_sync_evt.nsec = rx_hw_nsec;
-                sync_rx_ts_valid_count++;
-            }
-            else
-            {
-                g_sync_evt.sec  = rx_sec;
-                g_sync_evt.nsec = rx_nsec;
-            }
-        }
-        else if (ptp_message == PTP_FOLLOW_UP)
-        {
-            const uint8_t *ts = &buf[48];
-
-            g_follow_evt.pending = 1U;
-            g_follow_evt.seq_id  = ptp_seq_id;
-            g_follow_evt.sec     = PTP_ParseSecondsLow32(ts);
-            g_follow_evt.nsec    = PTP_ParseNanoseconds(ts);
-        }
-        else if (ptp_message == PTP_DELAY_RESP)
-        {
-            const uint8_t *ts = &buf[48];
-
-            /*
-             * In multi-slave setup, ignore Delay_Resp frames that are not for this slave.
-             * Master sends Delay_Resp as unicast to the requesting slave MAC and also
-             * copies requestingPortIdentity into bytes 58..67.
-             */
-            if (memcmp(&buf[0], g_slave_mac, 6U) != 0)
-            {
-                return;
-            }
-
-            if (memcmp(&buf[58], g_slave_port_identity, 10U) != 0)
-            {
-                return;
-            }
-
-            g_delayresp_evt.pending = 1U;
-            g_delayresp_evt.seq_id  = ptp_seq_id;
-            g_delayresp_evt.sec     = PTP_ParseSecondsLow32(ts);
-            g_delayresp_evt.nsec    = PTP_ParseNanoseconds(ts);
-            memcpy((void *)g_delayresp_evt.requesting_port_identity, &buf[58], 10U);
+            break;
         }
 
-        HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+        if (buf == NULL)
+        {
+            break;
+        }
+
+        PTP_HandleRxFrame(heth_local, buf);
     }
 }
 
@@ -1235,7 +1387,7 @@ static void PTP_LogSampleIfReady(void)
     len = snprintf(
         ptp_log_buf,
         sizeof(ptp_log_buf),
-        "DATA,%lu,%ld,%ld,%ld,%ld,%ld,%lu,%ld,%lu,%lu,%lu,%u,%lu,%lu,%ld,%ld,%ld,%u,%lu,%lu,%lu,%lu\r\n",
+		"DATA,%lu,%ld,%ld,%ld,%ld,%ld,%lu,%ld,%lu,%lu,%lu,%u,%lu,%lu,%lu,%lu,%ld,%ld,%ld,%u,%lu,%lu,%lu,%lu\r\n",
         (unsigned long)delayresp_count,
         (long)ptp_offset_ns,
         (long)ptp_raw_offset_e2e,
@@ -1248,9 +1400,11 @@ static void PTP_LogSampleIfReady(void)
         (unsigned long)ptp_phase_capture_step_count,
         (unsigned long)ptp_freq_update_count,
         (unsigned int)ptp_coarse_mode,
-        (unsigned long)sync_rx_ts_valid_count,
-        (unsigned long)tx_ts_seen,
-        (long)ptp_pi_prop_ppb,
+		(unsigned long)sync_rx_ts_valid_count,
+		(unsigned long)tx_ts_seen,
+		(unsigned long)ptp_delayreq_timeout_count,
+		(unsigned long)ptp_delayresp_ignored_count,
+		(long)ptp_pi_prop_ppb,
         (long)ptp_pi_integral_ppb,
         (long)ptp_pi_output_ppb,
         (unsigned int)ptp_last_sample_rejected,
@@ -1316,7 +1470,7 @@ int main(void)
   ETH->PTPPPSCR = 0x0U;   /* 1 Hz PPS */
 
   const char *hdr =
-      "FMT,sample,offset_ns,raw_offset_ns,offset_avg_ns,mean_path_delay_ns,freq_err_ppb,current_addend,last_addend_step,phase_step_count,phase_capture_step_count,freq_update_count,coarse_mode,sync_rx_ts_valid_count,tx_ts_seen,pi_prop_ppb,pi_integral_ppb,pi_output_ppb,last_sample_rejected,rejected_sample_count,reject_mpd_count,reject_abs_offset_count,reject_jump_count\r\n";
+		  "FMT,sample,offset_ns,raw_offset_ns,offset_avg_ns,mean_path_delay_ns,freq_err_ppb,current_addend,last_addend_step,phase_step_count,phase_capture_step_count,freq_update_count,coarse_mode,sync_rx_ts_valid_count,tx_ts_seen,delayreq_timeout_count,delayresp_ignored_count,pi_prop_ppb,pi_integral_ppb,pi_output_ppb,last_sample_rejected,rejected_sample_count,reject_mpd_count,reject_abs_offset_count,reject_jump_count\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t *)hdr, (uint16_t)strlen(hdr), 100);
 
   /* USER CODE END 2 */
@@ -1333,6 +1487,7 @@ int main(void)
 	  nsec = ETH->PTPTSLR;
 
 	  (void)PTP_TryReadTxTimestamp();
+	  PTP_CheckDelayReqTimeout();
 	  HAL_ETH_ReleaseTxPacket(&heth);
 	  PTP_Process();
 	  PTP_LogSampleIfReady();

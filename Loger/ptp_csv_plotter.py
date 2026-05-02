@@ -68,6 +68,8 @@ REJECTION_METRICS = [
     ("reject_mpd_count", "Rejected by MPD", "count", False),
     ("reject_abs_offset_count", "Rejected by abs. offset", "count", False),
     ("reject_jump_count", "Rejected by jump", "count", False),
+    ("delayreq_timeout_count", "DelayReq timeouts", "count", False),
+    ("delayresp_ignored_count", "Ignored DelayResp", "count", False),
 ]
 
 REQUIRED_COLUMNS = {
@@ -451,16 +453,17 @@ def calculate_stats(df: pd.DataFrame, log_name: str, window: SampleWindow) -> pd
         }
 
         for col in [
-            "offset_ns",
-            "offset_avg_ns",
-            "raw_offset_ns",
-            "mean_path_delay_ns",
-            "freq_err_ppb",
-            "pi_prop_ppb",
-            "pi_integral_ppb",
-            "pi_output_ppb",
-            "current_addend",
-            "last_addend_step",
+            "rejected_sample_count",
+            "reject_mpd_count",
+            "reject_abs_offset_count",
+            "reject_jump_count",
+            "delayreq_timeout_count",
+            "delayresp_ignored_count",
+            "phase_step_count",
+            "phase_capture_step_count",
+            "freq_update_count",
+            "sync_rx_ts_valid_count",
+            "tx_ts_seen",
         ]:
             if col not in group.columns:
                 continue

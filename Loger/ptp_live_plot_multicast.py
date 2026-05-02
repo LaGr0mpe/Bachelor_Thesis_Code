@@ -53,6 +53,8 @@ DATA_FIELDNAMES = [
     "coarse_mode",
     "sync_rx_ts_valid_count",
     "tx_ts_seen",
+    "delayreq_timeout_count",
+    "delayresp_ignored_count",
     "pi_prop_ppb",
     "pi_integral_ppb",
     "pi_output_ppb",
@@ -101,6 +103,8 @@ class SlaveState:
             "reject_mpd_count": deque(maxlen=WINDOW_POINTS),
             "reject_abs_offset_count": deque(maxlen=WINDOW_POINTS),
             "reject_jump_count": deque(maxlen=WINDOW_POINTS),
+            "delayreq_timeout_count": deque(maxlen=WINDOW_POINTS),
+            "delayresp_ignored_count": deque(maxlen=WINDOW_POINTS),
         }
 
 
@@ -223,19 +227,21 @@ def print_status(state: SlaveState, row: dict):
     mode = "COARSE" if row["coarse_mode"] else "FINE"
 
     print(
-        f"[{state.name}] "
-        f"rows={state.total_rows:6d}  "
-        f"id={row['sample']:6d}  "
-        f"mode={mode:6s}  "
-        f"offset={row['offset_ns']:8d} ns  "
-        f"avg={row['offset_avg_ns']:8d} ns  "
-        f"mpd={row['mean_path_delay_ns']:6d} ns  "
-        f"pi={row['pi_output_ppb']:8d} ppb  "
-        f"addend={row['current_addend']}  "
-        f"rej={row['last_sample_rejected']}  "
-        f"rej_total={row['rejected_sample_count']}  "
-        f"rej_mpd={row['reject_mpd_count']}"
-    )
+    f"[{state.name}] "
+    f"rows={state.total_rows:6d}  "
+    f"id={row['sample']:6d}  "
+    f"mode={mode:6s}  "
+    f"offset={row['offset_ns']:8d} ns  "
+    f"avg={row['offset_avg_ns']:8d} ns  "
+    f"mpd={row['mean_path_delay_ns']:6d} ns  "
+    f"pi={row['pi_output_ppb']:8d} ppb  "
+    f"addend={row['current_addend']}  "
+    f"rej={row['last_sample_rejected']}  "
+    f"rej_total={row['rejected_sample_count']}  "
+    f"rej_mpd={row['reject_mpd_count']}  "
+    f"to={row['delayreq_timeout_count']}  "
+    f"ign={row['delayresp_ignored_count']}"
+)
 
 
 # =========================
@@ -343,13 +349,17 @@ def slave_summary_for_title(state: SlaveState) -> str:
     reject_mpd = latest_value(state, "reject_mpd_count")
     reject_abs = latest_value(state, "reject_abs_offset_count")
     reject_jump = latest_value(state, "reject_jump_count")
+    timeout = latest_value(state, "delayreq_timeout_count")
+    ignored = latest_value(state, "delayresp_ignored_count")
 
     return (
         f"{state.name}: rows={state.total_rows}, "
         f"rejected={rejected}, "
         f"mpd={reject_mpd}, "
         f"abs={reject_abs}, "
-        f"jump={reject_jump}"
+        f"jump={reject_jump}, "
+        f"to={timeout}, "
+        f"ign={ignored}"
     )
 
 

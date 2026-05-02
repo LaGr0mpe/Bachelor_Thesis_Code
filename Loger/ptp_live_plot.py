@@ -13,7 +13,7 @@ from matplotlib.animation import FuncAnimation
 # CONFIG
 # =========================
 
-PORT = "COM5"          # поменяй на свой COM-порт
+PORT = "COM5"
 BAUD = 115200
 
 WINDOW_POINTS = 500
@@ -21,7 +21,6 @@ PLOT_INTERVAL_MS = 200
 PRINT_EVERY_N_SAMPLES = 20
 
 CSV_PREFIX = "ptp_slave_live_log"
-RAW_PREFIX = "ptp_slave_raw_log"
 
 SERIAL_TIMEOUT = 0.02
 
@@ -45,6 +44,8 @@ FIELDNAMES = [
     "coarse_mode",
     "sync_rx_ts_valid_count",
     "tx_ts_seen",
+    "delayreq_timeout_count",
+    "delayresp_ignored_count",
     "pi_prop_ppb",
     "pi_integral_ppb",
     "pi_output_ppb",
@@ -55,7 +56,7 @@ FIELDNAMES = [
     "reject_jump_count",
 ]
 
-EXPECTED_PARTS = 1 + len(FIELDNAMES)  # DATA + fields
+EXPECTED_PARTS = 1 + len(FIELDNAMES)
 
 
 # =========================
@@ -75,16 +76,19 @@ buffers = {
     "coarse_mode": deque(maxlen=WINDOW_POINTS),
     "last_sample_rejected": deque(maxlen=WINDOW_POINTS),
     "rejected_sample_count": deque(maxlen=WINDOW_POINTS),
+    "reject_mpd_count": deque(maxlen=WINDOW_POINTS),
+    "reject_abs_offset_count": deque(maxlen=WINDOW_POINTS),
+    "reject_jump_count": deque(maxlen=WINDOW_POINTS),
+    "delayreq_timeout_count": deque(maxlen=WINDOW_POINTS),
+    "delayresp_ignored_count": deque(maxlen=WINDOW_POINTS),
 }
 
 ser = None
 csv_file = None
-raw_file = None
 csv_writer = None
 
 total_rows = 0
-bad_rows = 0
-last_print_time = time.time()
+parse_errors = 0
 
 
 # =========================
@@ -92,12 +96,6 @@ last_print_time = time.time()
 # =========================
 
 def parse_data_line(line: str):
-    """
-    Parses current STM32 line:
-
-    DATA,sample,offset_ns,raw_offset_ns,offset_avg_ns,...
-    """
-
     if not line.startswith("DATA,"):
         return None
 
@@ -122,17 +120,24 @@ def append_row_to_buffers(row: dict):
         buffers[key].append(row[key])
 
 
+def latest_value(key: str, default=0):
+    buf = buffers.get(key)
+    if not buf:
+        return default
+    if len(buf) == 0:
+        return default
+    return buf[-1]
+
+
 # =========================
 # SERIAL POLLING
 # =========================
 
 def poll_serial():
-    global total_rows, bad_rows, last_print_time
+    global total_rows, parse_errors
 
     if ser is None:
         return
-
-    lines_read = 0
 
     while True:
         raw = ser.readline()
@@ -140,14 +145,10 @@ def poll_serial():
         if not raw:
             break
 
-        lines_read += 1
-
         line = raw.decode("utf-8", errors="replace").strip()
 
         if not line:
             continue
-
-        raw_file.write(line + "\n")
 
         if line.startswith("FMT,"):
             print("\nReceived format from STM32:")
@@ -160,21 +161,18 @@ def poll_serial():
         try:
             row = parse_data_line(line)
         except Exception as exc:
-            bad_rows += 1
-            print(f"\nParse error #{bad_rows}: {exc}")
+            parse_errors += 1
+            print(f"\nParse error #{parse_errors}: {exc}")
             continue
 
         csv_writer.writerow(row)
         csv_file.flush()
-        raw_file.flush()
 
         append_row_to_buffers(row)
         total_rows += 1
 
         if total_rows % PRINT_EVERY_N_SAMPLES == 0:
             print_status(row)
-
-    return lines_read
 
 
 def print_status(row: dict):
@@ -192,7 +190,10 @@ def print_status(row: dict):
         f"addend={row['current_addend']}  "
         f"step={row['last_addend_step']:6d}  "
         f"rej={row['last_sample_rejected']}  "
-        f"rej_total={row['rejected_sample_count']}"
+        f"rej_total={row['rejected_sample_count']}  "
+        f"rej_mpd={row['reject_mpd_count']}  "
+        f"to={row['delayreq_timeout_count']}  "
+        f"ign={row['delayresp_ignored_count']}"
     )
 
 
@@ -203,22 +204,18 @@ def print_status(row: dict):
 def update_axis(ax, x, y, title, ylabel, zero_line=False):
     ax.clear()
 
+    ax.set_title(title)
+    ax.set_xlabel("sample")
+    ax.set_ylabel(ylabel)
+    ax.grid(True)
+
     if len(x) == 0 or len(y) == 0:
-        ax.set_title(title)
-        ax.set_xlabel("sample")
-        ax.set_ylabel(ylabel)
-        ax.grid(True)
         return
 
     ax.plot(x, y)
 
     if zero_line:
         ax.axhline(0, linewidth=1)
-
-    ax.set_title(title)
-    ax.set_xlabel("sample")
-    ax.set_ylabel(ylabel)
-    ax.grid(True)
 
     xmin = min(x)
     xmax = max(x)
@@ -237,6 +234,21 @@ def update_axis(ax, x, y, title, ylabel, zero_line=False):
         margin = max((ymax - ymin) * 0.1, 1.0)
 
     ax.set_ylim(ymin - margin, ymax + margin)
+
+
+def title_status():
+    rejected = latest_value("rejected_sample_count")
+    reject_mpd = latest_value("reject_mpd_count")
+    reject_abs = latest_value("reject_abs_offset_count")
+    reject_jump = latest_value("reject_jump_count")
+    timeout = latest_value("delayreq_timeout_count")
+    ignored = latest_value("delayresp_ignored_count")
+
+    return (
+        f"STM32 PTP Slave Live Monitor | rows={total_rows} | "
+        f"rejected={rejected}, mpd={reject_mpd}, abs={reject_abs}, "
+        f"jump={reject_jump}, timeout={timeout}, ignored={ignored}"
+    )
 
 
 def animate(_frame):
@@ -298,11 +310,7 @@ def animate(_frame):
         zero_line=True,
     )
 
-    fig.suptitle(
-        f"STM32 PTP Slave Live Monitor | rows={total_rows}, parse_errors={bad_rows}",
-        fontsize=12,
-    )
-
+    fig.suptitle(title_status(), fontsize=11)
     fig.tight_layout()
 
 
@@ -327,43 +335,30 @@ def on_close(_event):
     except Exception as exc:
         print(f"CSV close error: {exc}")
 
-    try:
-        if raw_file is not None:
-            raw_file.close()
-            print("Raw log closed.")
-    except Exception as exc:
-        print(f"Raw log close error: {exc}")
-
 
 # =========================
 # MAIN
 # =========================
 
 def main():
-    global ser, csv_file, raw_file, csv_writer
+    global ser, csv_file, csv_writer
     global fig, ax1, ax2, ax3, ax4, ax5, ax6
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     out_dir = Path(".")
     csv_name = out_dir / f"{CSV_PREFIX}_{timestamp}.csv"
-    raw_name = out_dir / f"{RAW_PREFIX}_{timestamp}.txt"
 
     print(f"Opening serial: {PORT} @ {BAUD}")
     print(f"CSV log:       {csv_name}")
-    print(f"Raw log:       {raw_name}")
     print("Close the plot window to stop.\n")
 
     ser = serial.Serial(PORT, BAUD, timeout=SERIAL_TIMEOUT)
 
-    # Дать порту немного времени после открытия
     time.sleep(0.5)
-
-    # Очистить старый мусор из буфера
     ser.reset_input_buffer()
 
     csv_file = open(csv_name, "w", newline="", encoding="utf-8")
-    raw_file = open(raw_name, "w", newline="", encoding="utf-8")
 
     csv_writer = csv.DictWriter(csv_file, fieldnames=FIELDNAMES)
     csv_writer.writeheader()

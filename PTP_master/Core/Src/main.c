@@ -105,6 +105,9 @@ uint8_t followup_frame[58];
 uint8_t delayresp_frame[68];
 
 volatile uint16_t master_sync_seq_id = 0U;
+
+volatile uint16_t sync_tx_wait_seq_id = 0U;
+
 volatile uint32_t sync_t1_sec = 0U;
 volatile uint32_t sync_t1_nsec = 0U;
 volatile uint8_t  sync_tx_ts_waiting = 0U;
@@ -469,6 +472,8 @@ static uint8_t PTP_MasterSendSync(void)
   seq_id = (uint16_t)(++master_sync_seq_id);
   PTP_BuildSyncFrame(sync_frame, seq_id);
 
+  sync_tx_wait_seq_id = seq_id;
+
   sync_tx_desc_idx = heth.TxDescList.CurTxDesc;
   txdesc = (ETH_DMADescTypeDef *)heth.TxDescList.TxDesc[sync_tx_desc_idx];
   td = (uint32_t *)txdesc;
@@ -507,16 +512,20 @@ static uint8_t PTP_MasterTryReadSyncTxTimestamp(void)
       sync_tx_seen++;
       sync_tx_ts_waiting = 0U;
 
-      followup_seq_id  = master_sync_seq_id;
+      followup_seq_id  = sync_tx_wait_seq_id;
       followup_t1_sec  = sync_t1_sec;
       followup_t1_nsec = sync_t1_nsec;
       followup_pending = 1U;
+
+      sync_tx_wait_seq_id = 0U;
 
       return 1U;
     }
 
     tx_ts_miss_count++;
     sync_tx_ts_waiting = 0U;
+
+    sync_tx_wait_seq_id = 0U;
   }
 
   return 0U;
@@ -682,15 +691,27 @@ void HAL_ETH_TxFreeCallback(uint32_t *buff)
 
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_ptr)
 {
-  uint8_t *buf = NULL;
-
-  if (HAL_ETH_ReadData(heth_ptr, (void **)&buf) == HAL_OK)
+  while (1)
   {
-    uint16_t eth_type = (uint16_t)(((uint16_t)buf[12] << 8) | buf[13]);
+    uint8_t *buf = NULL;
 
-    if (eth_type == 0x88F7U)
+    if (HAL_ETH_ReadData(heth_ptr, (void **)&buf) != HAL_OK)
     {
-      PTP_MasterHandlePtpRx(heth_ptr, buf);
+      break;
+    }
+
+    if (buf == NULL)
+    {
+      break;
+    }
+
+    {
+      uint16_t eth_type = (uint16_t)(((uint16_t)buf[12] << 8) | buf[13]);
+
+      if (eth_type == 0x88F7U)
+      {
+        PTP_MasterHandlePtpRx(heth_ptr, buf);
+      }
     }
   }
 }
