@@ -62,6 +62,22 @@ typedef struct
 #define PTP_DELAYREQ_QUEUE_LEN          16U
 #define PTP_DELAYRESP_TX_TIMEOUT_MS     10U
 #define PTP_DELAYRESP_PER_LOOP_LIMIT     4U
+
+
+
+#define APP_CPU_LOAD_ENABLE              0U
+
+/*
+ * Safe artificial CPU load.
+ * This is NOT exact percent load.
+ * It performs a bounded amount of dummy work every N milliseconds.
+ *
+ * Start with 100 or 200.
+ * Then test 500, 1000, 2000, etc.
+ */
+#define APP_CPU_LOAD_PERIOD_MS           1U
+#define APP_CPU_LOAD_WORK_ITERATIONS     1U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -151,6 +167,14 @@ static const uint8_t g_ptp_multicast_mac[6] =
 };
 
 static uint32_t sync_tx_desc_idx = 0U;
+
+
+
+volatile uint32_t app_cpu_load_run_count = 0U;
+volatile uint32_t app_cpu_load_sink = 0U;
+
+static uint32_t app_cpu_load_last_ms = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -178,6 +202,9 @@ static uint8_t PTP_DelayReqQueuePeek(PTP_DelayReqEvent *evt);
 static void    PTP_DelayReqQueueDropFront(void);
 static uint8_t PTP_MasterSendFrameBlocking(uint8_t *frame, uint16_t length, uint32_t timeout_ms);
 static void ETH_SetMacAddressFilter1(const uint8_t *mac);
+
+static void APP_RunCpuLoad(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -739,6 +766,49 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth_ptr)
     }
   }
 }
+
+
+static void APP_RunCpuLoad(void)
+{
+#if APP_CPU_LOAD_ENABLE
+    uint32_t now;
+    uint32_t i;
+    uint32_t x;
+
+    now = HAL_GetTick();
+
+    if ((uint32_t)(now - app_cpu_load_last_ms) < APP_CPU_LOAD_PERIOD_MS)
+    {
+        return;
+    }
+
+    app_cpu_load_last_ms = now;
+
+    /*
+     * Bounded dummy CPU work.
+     * No DWT.
+     * No infinite waiting.
+     * Interrupts remain enabled.
+     */
+    x = app_cpu_load_sink;
+
+    for (i = 0U; i < APP_CPU_LOAD_WORK_ITERATIONS; i++)
+    {
+        x = x * 1664525UL + 1013904223UL;
+        x ^= (x >> 16);
+        x += i;
+    }
+
+    app_cpu_load_sink = x;
+
+    if (app_cpu_load_run_count < 0xFFFFFFFFUL)
+    {
+        app_cpu_load_run_count++;
+    }
+#endif
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -782,6 +852,7 @@ int main(void)
     HAL_NVIC_EnableIRQ(ETH_IRQn);
 
     PTP_MasterHwInit();
+
     ETH->PTPPPSCR = 0x0U;   /* PPS = 1 Hz */
 
     if (HAL_ETH_Start_IT(&heth) != HAL_OK)
@@ -803,6 +874,9 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  PTP_MasterProcess();
+
+	  APP_RunCpuLoad();
+
   }
   /* USER CODE END 3 */
 }
